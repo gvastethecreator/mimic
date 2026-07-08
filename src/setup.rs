@@ -29,12 +29,12 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// Returns the path to the AppData folder for Vicam
+/// Returns the path to the AppData folder for Mimic
 pub fn get_app_dir() -> PathBuf {
     let mut path = dirs_next::data_dir().unwrap_or_else(|| {
         PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:".to_string()))
     });
-    path.push("vicam");
+    path.push("mimic");
     let _ = std::fs::create_dir_all(&path);
     path
 }

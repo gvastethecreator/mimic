@@ -53,7 +53,7 @@ impl Default for AppConfig {
     }
 }
 
-pub struct VicamApp {
+pub struct MimicApp {
     config: AppConfig,
     config_path: PathBuf,
     
@@ -88,7 +88,7 @@ pub struct VicamApp {
     setup_rx: Receiver<SetupMessage>,
 }
 
-impl VicamApp {
+impl MimicApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Set beautiful dark styling
         let mut visuals = egui::Visuals::dark();
@@ -258,7 +258,7 @@ impl VicamApp {
     }
 }
 
-impl eframe::App for VicamApp {
+impl eframe::App for MimicApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Process background setup messages
         while let Ok(msg) = self.setup_rx.try_recv() {
@@ -377,7 +377,7 @@ impl eframe::App for VicamApp {
         // 3. Layout Rendering
         egui::TopBottomPanel::top("top_bar").frame(egui::Frame::none().fill(egui::Color32::from_rgb(15, 15, 20)).inner_margin(8.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("⚡ Vicam");
+                ui.heading("⚡ Mimic");
                 ui.label("• Virtual Webcam Simulator");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Status Badge
