@@ -1,4 +1,5 @@
 /target
+/.scratch/
 
 # IDEs and editors
 .vscode/

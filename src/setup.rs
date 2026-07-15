@@ -1,35 +1,50 @@
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::ptr;
+use std::thread;
+use std::time::Duration;
 
-// Raw Win32 FFI declarations to ensure compiling with no feature issues
-#[cfg(target_os = "windows")]
+use sha2::{Digest, Sha256};
+
+const FFMPEG_URL: &str =
+    "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64";
+const FFMPEG_BYTES: u64 = 82_797_568;
+const FFMPEG_SHA256: &str = "04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00";
+const UNITY_CAPTURE_URL: &str = "https://raw.githubusercontent.com/schellingb/UnityCapture/3ed54c325e0ad71afcf4f246c07e5e17b3d7f2d2/Install/UnityCaptureFilter64.dll";
+const UNITY_CAPTURE_BYTES: u64 = 157_696;
+const UNITY_CAPTURE_SHA256: &str =
+    "72812f5363d8ecb45632253f8c8c888844b1b62e27616f3c8cc21064ccde25e5";
+
 unsafe extern "system" {
     pub fn ShellExecuteW(
         hwnd: isize,
-        lpOperation: *const u16,
-        lpFile: *const u16,
-        lpParameters: *const u16,
-        lpDirectory: *const u16,
-        nShowCmd: i32,
+        lp_operation: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        show_command: i32,
     ) -> isize;
-
-    pub fn RegOpenKeyExW(
-        hKey: isize,
-        lpSubKey: *const u16,
-        ulOptions: u32,
-        samDesired: u32,
-        phkResult: *mut isize,
-    ) -> i32;
-
-    pub fn RegCloseKey(
-        hKey: isize,
-    ) -> i32;
 }
 
-/// Returns the path to the AppData folder for Mimic
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualCameraBackend {
+    Obs,
+    UnityCapture,
+}
+
+impl VirtualCameraBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Obs => "OBS Virtual Camera",
+            Self::UnityCapture => "Unity Video Capture",
+        }
+    }
+}
+
 pub fn get_app_dir() -> PathBuf {
     let mut path = dirs_next::data_dir().unwrap_or_else(|| {
         PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:".to_string()))
@@ -39,193 +54,290 @@ pub fn get_app_dir() -> PathBuf {
     path
 }
 
-/// Checks if ffmpeg is in the system PATH
-pub fn is_ffmpeg_in_path() -> bool {
-    let cmd = if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" };
-    Command::new(cmd)
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Returns the path to ffmpeg.exe if available (system path or local AppData)
 pub fn get_ffmpeg_path() -> Option<PathBuf> {
-    if is_ffmpeg_in_path() {
-        return Some(PathBuf::from("ffmpeg"));
+    let mut candidates = vec![PathBuf::from("ffmpeg"), get_app_dir().join("ffmpeg.exe")];
+    if let Some(local) = local_executable_sibling("ffmpeg.exe") {
+        candidates.push(local);
     }
-    
-    // Check in AppData
-    let mut app_ffmpeg = get_app_dir();
-    app_ffmpeg.push("ffmpeg.exe");
-    if app_ffmpeg.exists() {
-        return Some(app_ffmpeg);
-    }
-    
-    // Check in local directory
-    if let Ok(mut exe_dir) = std::env::current_exe() {
-        exe_dir.pop();
-        exe_dir.push("ffmpeg.exe");
-        if exe_dir.exists() {
-            return Some(exe_dir);
-        }
-    }
-    
-    None
+
+    candidates
+        .into_iter()
+        .find(|candidate| validate_ffmpeg(candidate))
 }
 
-/// Checks if the Unity Video Capture DLL exists in our AppData directory
+pub fn validate_ffmpeg(path: &Path) -> bool {
+    Command::new(path)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 pub fn get_dll_path() -> PathBuf {
-    let mut dll_path = get_app_dir();
-    dll_path.push("UnityCaptureFilter64.dll");
-    dll_path
+    get_app_dir().join("UnityCaptureFilter64.dll")
 }
 
-/// Downloads a file from a URL using ureq and writes it to a file path.
-/// Emits progress between 0.0 and 1.0.
-pub fn download_file<F>(url: &str, destination: &Path, progress_cb: F) -> Result<(), String>
-where
-    F: Fn(f32),
-{
-    let response = ureq::get(url)
-        .call()
-        .map_err(|e| format!("Failed to call URL: {}", e))?;
-    
-    let total_size = response
-        .header("Content-Length")
-        .and_then(|len| len.parse::<u64>().ok())
-        .unwrap_or(0);
-        
-    let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(destination)
-        .map_err(|e| format!("Failed to create destination file: {}", e))?;
-        
-    let mut buffer = [0u8; 16384];
-    let mut downloaded = 0u64;
-    
-    loop {
-        let bytes_read = reader
-            .read(&mut buffer)
-            .map_err(|e| format!("Failed reading stream: {}", e))?;
-            
-        if bytes_read == 0 {
-            break;
-        }
-        
-        std::io::Write::write_all(&mut file, &buffer[..bytes_read])
-            .map_err(|e| format!("Failed writing file: {}", e))?;
-            
-        downloaded += bytes_read as u64;
-        if total_size > 0 {
-            let progress = downloaded as f32 / total_size as f32;
-            progress_cb(progress);
-        }
+pub fn available_virtual_camera_backends() -> Vec<VirtualCameraBackend> {
+    let mut backends = Vec::new();
+    if virtualcam::backend::windows_obs::is_available() {
+        backends.push(VirtualCameraBackend::Obs);
     }
-    
-    Ok(())
+    if virtualcam::backend::windows_unity::is_available() {
+        backends.push(VirtualCameraBackend::UnityCapture);
+    }
+    backends
 }
 
-/// Downloads a lightweight static ffmpeg build for Windows
-pub fn download_ffmpeg<F>(progress_cb: F) -> Result<PathBuf, String>
+pub fn is_unity_capture_registered() -> bool {
+    virtualcam::backend::windows_unity::is_available()
+}
+
+pub fn download_ffmpeg<F>(progress_callback: F) -> Result<PathBuf, String>
 where
     F: Fn(f32),
 {
     let destination = get_app_dir().join("ffmpeg.exe");
-    // Lightweight portable static ffmpeg URL (e.g. from standard reliable releases or custom proxy)
-    // Note: We use a trusted, stable URL for a standalone windows ffmpeg binary.
-    // For simplicity, we can fetch a precompiled 64-bit static executable.
-    let url = "https://github.com/eugeneware/ffmpeg-static/releases/download/b5.0.1/win32-x64";
-    download_file(url, &destination, progress_cb)?;
+    download_verified(
+        FFMPEG_URL,
+        &destination,
+        FFMPEG_BYTES,
+        FFMPEG_SHA256,
+        progress_callback,
+    )?;
+    if !validate_ffmpeg(&destination) {
+        let _ = std::fs::remove_file(&destination);
+        return Err("Downloaded FFmpeg did not pass its executable self-check".to_string());
+    }
     Ok(destination)
 }
 
-/// Downloads the Unity Capture Filter 64-bit DLL
-pub fn download_driver<F>(progress_cb: F) -> Result<PathBuf, String>
+pub fn download_driver<F>(progress_callback: F) -> Result<PathBuf, String>
 where
     F: Fn(f32),
 {
     let destination = get_dll_path();
-    let url = "https://github.com/schellingb/UnityCapture/raw/master/Install/UnityCaptureFilter64.dll";
-    download_file(url, &destination, progress_cb)?;
+    download_verified(
+        UNITY_CAPTURE_URL,
+        &destination,
+        UNITY_CAPTURE_BYTES,
+        UNITY_CAPTURE_SHA256,
+        progress_callback,
+    )?;
     Ok(destination)
 }
 
-/// Checks if the Unity Video Capture device is registered in Windows DirectShow.
-/// We can check if `virtualcam` can initialize it, or inspect registration registry keys.
-pub fn is_driver_registered() -> bool {
-    // Under Windows, we check if the virtualcam device can be instantiated or if its registry entries are present.
-    // Specifically, let's query the CLSID of Unity Capture Filter: {A91FD3C7-15E8-4e89-940E-6F3C01234567}
-    #[cfg(target_os = "windows")]
-    {
-        let subkey = OsStr::new("CLSID\\{A91FD3C7-15E8-4e89-940E-6F3C01234567}")
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<u16>>();
-            
-        let hkey_classes_root = -2147483648isize; // HKEY_CLASSES_ROOT
-        let key_read = 0x20019u32;                // KEY_READ
-        let mut key = 0isize;
-        
-        let status = unsafe {
-            RegOpenKeyExW(
-                hkey_classes_root,
-                subkey.as_ptr(),
-                0,
-                key_read,
-                &mut key,
-            )
-        };
-        
-        if status == 0 {
-            // Key exists, so it's registered!
-            // Close the key
-            unsafe {
-                RegCloseKey(key);
-            }
-            return true;
-        }
-    }
-    
-    false
-}
-
-/// Registers the Unity Capture Filter DLL with administrator rights via UAC dialog.
-#[cfg(target_os = "windows")]
 pub fn register_driver_elevated(dll_path: &Path) -> Result<bool, String> {
-    let file = OsStr::new("regsvr32.exe");
-    let mut file_wide: Vec<u16> = file.encode_wide().collect();
-    file_wide.push(0);
+    if is_unity_capture_registered() {
+        return Ok(true);
+    }
 
-    let args = format!("/s \"{}\"", dll_path.to_string_lossy());
-    let args_os = OsStr::new(&args);
-    let mut args_wide: Vec<u16> = args_os.encode_wide().collect();
-    args_wide.push(0);
-
-    let verb = OsStr::new("runas");
-    let mut verb_wide: Vec<u16> = verb.encode_wide().collect();
-    verb_wide.push(0);
+    let file = wide_string(OsStr::new("regsvr32.exe"));
+    let parameters = wide_string(OsStr::new(&format!("/s \"{}\"", dll_path.display())));
+    let verb = wide_string(OsStr::new("runas"));
 
     let result = unsafe {
         ShellExecuteW(
             0,
-            verb_wide.as_ptr(),
-            file_wide.as_ptr(),
-            args_wide.as_ptr(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            parameters.as_ptr(),
             ptr::null(),
-            5, // SW_SHOW
+            5,
         )
     };
-    
-    if (result as usize) > 32 {
-        Ok(true)
+
+    if result as usize <= 32 {
+        return Err(format!(
+            "Administrator approval was denied or registration could not start (code {})",
+            result as usize
+        ));
+    }
+
+    for _ in 0..120 {
+        if is_unity_capture_registered() {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    Err("Registration finished without a detectable Unity Capture device. Restart Mimic or install the driver manually from its official package.".to_string())
+}
+
+fn download_verified<F>(
+    url: &str,
+    destination: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    progress_callback: F,
+) -> Result<(), String>
+where
+    F: Fn(f32),
+{
+    if destination.exists()
+        && file_matches(destination, expected_bytes, expected_sha256).unwrap_or(false)
+    {
+        progress_callback(1.0);
+        return Ok(());
+    }
+
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "Download destination has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create download directory: {error}"))?;
+    let partial = append_suffix(destination, ".download");
+    let _ = std::fs::remove_file(&partial);
+
+    let result = (|| -> Result<(), String> {
+        let response = ureq::get(url)
+            .timeout(Duration::from_secs(90))
+            .call()
+            .map_err(|error| format!("Download request failed: {error}"))?;
+        let reported_bytes = response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok());
+        if reported_bytes.is_some_and(|bytes| bytes != expected_bytes) {
+            return Err(format!(
+                "Download size changed upstream (expected {expected_bytes} bytes, server reported {} bytes)",
+                reported_bytes.unwrap()
+            ));
+        }
+
+        let mut reader = response.into_reader();
+        let mut file = File::create(&partial)
+            .map_err(|error| format!("Could not create partial download: {error}"))?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut downloaded = 0_u64;
+
+        loop {
+            let bytes_read = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("Download stream failed: {error}"))?;
+            if bytes_read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..bytes_read])
+                .map_err(|error| format!("Could not write partial download: {error}"))?;
+            hash.update(&buffer[..bytes_read]);
+            downloaded += bytes_read as u64;
+            progress_callback((downloaded as f32 / expected_bytes as f32).clamp(0.0, 1.0));
+        }
+
+        file.sync_all()
+            .map_err(|error| format!("Could not flush downloaded file: {error}"))?;
+        if downloaded != expected_bytes {
+            return Err(format!(
+                "Downloaded file is incomplete (expected {expected_bytes} bytes, received {downloaded})"
+            ));
+        }
+        let actual_sha256 = format!("{:x}", hash.finalize());
+        if actual_sha256 != expected_sha256 {
+            return Err(format!(
+                "Downloaded file failed integrity verification (expected SHA-256 {expected_sha256}, got {actual_sha256})"
+            ));
+        }
+
+        replace_file(&partial, destination)
+            .map_err(|error| format!("Could not activate downloaded file: {error}"))?;
+        progress_callback(1.0);
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    result
+}
+
+fn file_matches(path: &Path, expected_bytes: u64, expected_sha256: &str) -> io::Result<bool> {
+    if std::fs::metadata(path)?.len() != expected_bytes {
+        return Ok(false);
+    }
+    Ok(sha256_file(path)? == expected_sha256)
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hash.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn local_executable_sibling(file_name: &str) -> Option<PathBuf> {
+    let mut directory = std::env::current_exe().ok()?;
+    directory.pop();
+    Some(directory.join(file_name))
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    let source = wide_string(source.as_os_str());
+    let destination = wide_string(destination.as_os_str());
+    let result = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
     } else {
-        Err(format!("UAC elevation failed or was denied (code: {})", result as usize))
+        Ok(())
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn register_driver_elevated(_dll_path: &Path) -> Result<bool, String> {
-    Err("Only supported on Windows".to_string())
+fn wide_string(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_matches_known_value() {
+        let root = std::env::temp_dir().join(format!("mimic-hash-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.bin");
+        std::fs::write(&path, b"mimic").unwrap();
+
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "692e51978c0e4aa1f130e5cb9a536421f7925c8bae0a2291414791b9f86ee000"
+        );
+        assert!(
+            file_matches(
+                &path,
+                5,
+                "692e51978c0e4aa1f130e5cb9a536421f7925c8bae0a2291414791b9f86ee000"
+            )
+            .unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backend_labels_are_user_facing() {
+        assert_eq!(VirtualCameraBackend::Obs.label(), "OBS Virtual Camera");
+        assert_eq!(
+            VirtualCameraBackend::UnityCapture.label(),
+            "Unity Video Capture"
+        );
+    }
 }

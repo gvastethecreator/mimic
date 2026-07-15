@@ -1,6 +1,5 @@
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8,849 +7,1420 @@ use eframe::egui;
 use rfd::FileDialog;
 
 use crate::compositor::{FrameCompositor, PipPosition};
+use crate::config::{self, AppConfig, MEDIA_EXTENSIONS};
 use crate::decoder::MediaDecoder;
-use crate::setup;
+use crate::setup::{self, VirtualCameraBackend};
 use crate::webcam::{self, WebcamCapture};
 
+const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(14, 16, 20);
+const PANEL: egui::Color32 = egui::Color32::from_rgb(20, 23, 29);
+const CARD: egui::Color32 = egui::Color32::from_rgb(27, 31, 39);
+const BORDER: egui::Color32 = egui::Color32::from_rgb(48, 55, 68);
+const TEXT: egui::Color32 = egui::Color32::from_rgb(232, 235, 241);
+const MUTED: egui::Color32 = egui::Color32::from_rgb(146, 154, 171);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(74, 164, 255);
+const SUCCESS: egui::Color32 = egui::Color32::from_rgb(80, 204, 145);
+const WARNING: egui::Color32 = egui::Color32::from_rgb(244, 180, 76);
+const DANGER: egui::Color32 = egui::Color32::from_rgb(244, 102, 110);
 
 pub enum SetupMessage {
     FfmpegProgress(f32),
     FfmpegSuccess(PathBuf),
     FfmpegFailure(String),
     DriverProgress(f32),
-    DriverSuccess(PathBuf),
+    DriverSuccess,
     DriverFailure(String),
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-pub struct AppConfig {
-    pub playlist: Vec<PathBuf>,
-    pub selected_webcam: Option<String>,
-    pub pip_enabled: bool,
-    pub pip_position: PipPosition,
-    pub pip_border_radius: u32,
-    pub pip_scale: f32,
-    pub loop_playlist: bool,
-    pub output_resolution_index: usize, // 0: 1280x720, 1: 1920x1080, 2: 640x480
-    pub output_fps_index: usize,        // 0: 30 FPS, 1: 60 FPS
-    pub current_index: Option<usize>,
+#[derive(Clone, Copy)]
+enum NoticeLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            playlist: Vec::new(),
-            selected_webcam: None,
-            pip_enabled: false,
-            pip_position: PipPosition::BottomRight,
-            pip_border_radius: 16,
-            pip_scale: 0.25,
-            loop_playlist: true,
-            output_resolution_index: 0, // 1280x720
-            output_fps_index: 0,        // 30 FPS
-            current_index: None,
-        }
-    }
+#[derive(Clone)]
+struct Notice {
+    level: NoticeLevel,
+    title: String,
+    message: String,
 }
 
 pub struct MimicApp {
     config: AppConfig,
     config_path: PathBuf,
-    
-    // Environment states
     ffmpeg_path: Option<PathBuf>,
-    driver_registered: bool,
-    
-    // Async download indicators
+    virtual_camera_backends: Vec<VirtualCameraBackend>,
     downloading_ffmpeg: bool,
     ffmpeg_progress: f32,
-    downloading_driver: bool,
+    installing_driver: bool,
     driver_progress: f32,
-    error_msg: Option<String>,
-    
-    // Active streams & pipeline
+    notice: Option<Notice>,
     decoder: Option<MediaDecoder>,
     webcam_capture: Option<WebcamCapture>,
     compositor: FrameCompositor,
-    is_streaming: bool,
-    
-    // UI states
     available_webcams: Vec<String>,
     preview_texture: Option<egui::TextureHandle>,
-    last_composited_frame: Option<Vec<u8>>,
-    
-    // Timeline support
-    seek_drag_val: Option<f32>,
-    last_ui_update: Instant,
-
-    // Background thread channels
+    last_main_frame: Option<Vec<u8>>,
+    last_webcam_frame: Option<Vec<u8>>,
+    blank_frame: Vec<u8>,
+    preview_dirty: bool,
+    seek_drag_value: Option<f32>,
+    last_frame_tick: Instant,
     setup_tx: Sender<SetupMessage>,
     setup_rx: Receiver<SetupMessage>,
 }
 
 impl MimicApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Set beautiful dark styling
-        let mut visuals = egui::Visuals::dark();
-        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(20, 20, 25);
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 30, 40);
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(45, 45, 60);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(60, 60, 80);
-        visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(200, 200, 210);
-        visuals.window_fill = egui::Color32::from_rgb(20, 20, 25);
-        cc.egui_ctx.set_visuals(visuals);
-
-        // Load configuration
+        configure_style(&cc.egui_ctx);
         let config_path = setup::get_app_dir().join("config.json");
-        let config = if config_path.exists() {
-            std::fs::read_to_string(&config_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<AppConfig>(&s).ok())
-                .unwrap_or_default()
-        } else {
-            AppConfig::default()
-        };
-
+        let loaded = config::load(&config_path);
         let ffmpeg_path = setup::get_ffmpeg_path();
-        let driver_registered = setup::is_driver_registered();
-
-        let (target_w, target_h, target_fps) = Self::get_res_fps_values(&config);
-        let compositor = FrameCompositor::new(target_w, target_h, target_fps);
-
+        let virtual_camera_backends = setup::available_virtual_camera_backends();
+        let (width, height) = loaded.config.output_dimensions();
+        let compositor = FrameCompositor::new(width, height, loaded.config.output_fps());
+        let blank_frame = vec![0_u8; width as usize * height as usize * 3];
         let (setup_tx, setup_rx) = channel::<SetupMessage>();
 
         let mut app = Self {
-            config,
+            config: loaded.config,
             config_path,
             ffmpeg_path,
-            driver_registered,
+            virtual_camera_backends,
             downloading_ffmpeg: false,
             ffmpeg_progress: 0.0,
-            downloading_driver: false,
+            installing_driver: false,
             driver_progress: 0.0,
-            error_msg: None,
+            notice: loaded.warning.map(|message| Notice {
+                level: NoticeLevel::Warning,
+                title: "Settings recovered".to_string(),
+                message,
+            }),
             decoder: None,
             webcam_capture: None,
             compositor,
-            is_streaming: false,
             available_webcams: Vec::new(),
             preview_texture: None,
-            last_composited_frame: None,
-            seek_drag_val: None,
-            last_ui_update: Instant::now(),
+            last_main_frame: None,
+            last_webcam_frame: None,
+            blank_frame,
+            preview_dirty: false,
+            seek_drag_value: None,
+            last_frame_tick: Instant::now(),
             setup_tx,
             setup_rx,
         };
-
-        app.refresh_webcam_list();
-        app.start_selected_webcam();
-
+        app.refresh_webcam_list(false);
+        app.start_selected_webcam(false);
+        if app.config.current_index.is_some() {
+            app.play_current_playlist_item();
+        }
         app
     }
 
-    fn get_res_fps_values(config: &AppConfig) -> (u32, u32, f32) {
-        let (w, h) = match config.output_resolution_index {
-            1 => (1920, 1080),
-            2 => (640, 480),
-            _ => (1280, 720),
+    fn persist_config(&mut self) {
+        if let Err(error) = config::save(&self.config_path, &self.config) {
+            self.set_notice(NoticeLevel::Error, "Settings were not saved", error);
+        }
+    }
+
+    fn set_notice(
+        &mut self,
+        level: NoticeLevel,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.notice = Some(Notice {
+            level,
+            title: title.into(),
+            message: message.into(),
+        });
+    }
+
+    fn refresh_environment(&mut self) {
+        self.ffmpeg_path = setup::get_ffmpeg_path();
+        self.virtual_camera_backends = setup::available_virtual_camera_backends();
+    }
+
+    fn refresh_setup(&mut self) {
+        self.refresh_environment();
+        if self.ffmpeg_path.is_some() {
+            self.refresh_webcam_list(false);
+            if self.decoder.is_none() {
+                self.play_current_playlist_item();
+            }
+        }
+
+        if self.ffmpeg_path.is_some() && !self.virtual_camera_backends.is_empty() {
+            self.set_notice(
+                NoticeLevel::Success,
+                "Setup is ready",
+                "FFmpeg and a supported virtual-camera backend were detected.",
+            );
+        } else {
+            let mut missing = Vec::new();
+            if self.ffmpeg_path.is_none() {
+                missing.push("FFmpeg was not detected.");
+            }
+            if self.virtual_camera_backends.is_empty() {
+                missing.push("No supported virtual-camera backend was detected.");
+            }
+            self.set_notice(
+                NoticeLevel::Warning,
+                "Setup still needs attention",
+                missing.join(" "),
+            );
+        }
+    }
+
+    fn refresh_webcam_list(&mut self, report_result: bool) {
+        let Some(ffmpeg) = self.ffmpeg_path.as_ref() else {
+            self.available_webcams.clear();
+            return;
         };
-        let fps = match config.output_fps_index {
-            1 => 60.0,
-            _ => 30.0,
-        };
-        (w, h, fps)
-    }
-
-    fn save_config(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(&self.config) {
-            let _ = std::fs::write(&self.config_path, json);
+        match webcam::list_webcams(ffmpeg) {
+            Ok(devices) => {
+                self.available_webcams = devices;
+                if report_result {
+                    let message = if self.available_webcams.is_empty() {
+                        "No physical cameras were reported by DirectShow.".to_string()
+                    } else {
+                        format!(
+                            "Found {} physical camera{}.",
+                            self.available_webcams.len(),
+                            if self.available_webcams.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        )
+                    };
+                    self.set_notice(NoticeLevel::Info, "Camera scan complete", message);
+                }
+            }
+            Err(error) => {
+                self.available_webcams.clear();
+                self.set_notice(NoticeLevel::Error, "Camera scan failed", error);
+            }
         }
     }
 
-    fn refresh_webcam_list(&mut self) {
-        if let Some(ref path) = self.ffmpeg_path {
-            self.available_webcams = webcam::list_webcams(path);
+    fn start_selected_webcam(&mut self, report_missing_selection: bool) {
+        if let Some(capture) = self.webcam_capture.take() {
+            capture.stop();
         }
-    }
-
-    fn start_selected_webcam(&mut self) {
-        // Stop current webcam
-        if let Some(wc) = self.webcam_capture.take() {
-            wc.stop();
-        }
-
+        self.last_webcam_frame = None;
+        self.preview_dirty = true;
         if !self.config.pip_enabled {
             return;
         }
 
-        let device_name = match &self.config.selected_webcam {
-            Some(name) => name,
-            None => return,
-        };
-
-        if let Some(ref ffmpeg) = self.ffmpeg_path {
-            // Let's capture webcam PIP at 320x240 @ 30 FPS
-            match WebcamCapture::new(ffmpeg, device_name, 320, 240, 30.0) {
-                Ok(capture) => {
-                    self.webcam_capture = Some(capture);
-                }
-                Err(e) => {
-                    self.error_msg = Some(format!("Webcam capture error: {}", e));
-                }
+        let Some(device_name) = self.config.selected_webcam.clone() else {
+            if report_missing_selection {
+                self.set_notice(
+                    NoticeLevel::Warning,
+                    "Choose a physical camera",
+                    "Picture-in-picture is enabled, but no webcam is selected.",
+                );
             }
+            return;
+        };
+        let Some(ffmpeg) = self.ffmpeg_path.as_ref() else {
+            self.set_notice(
+                NoticeLevel::Error,
+                "FFmpeg is required",
+                "Install FFmpeg before enabling physical-camera capture.",
+            );
+            return;
+        };
+        let (width, height) = self.config.pip_dimensions();
+        match WebcamCapture::new(ffmpeg, &device_name, width, height, 30.0) {
+            Ok(capture) => self.webcam_capture = Some(capture),
+            Err(error) => self.set_notice(NoticeLevel::Error, "Webcam could not start", error),
         }
     }
 
-    fn update_pipeline_dimensions(&mut self) {
-        let (w, h, fps) = Self::get_res_fps_values(&self.config);
-        
-        // Stop currently playing
-        if let Some(dec) = self.decoder.take() {
-            dec.stop();
+    fn rebuild_pipeline(&mut self) {
+        let was_streaming = self.compositor.is_active();
+        if let Some(decoder) = self.decoder.take() {
+            decoder.stop();
         }
-        
         self.compositor.release();
-        self.compositor = FrameCompositor::new(w, h, fps);
-        
-        if self.is_streaming {
-            if let Err(e) = self.compositor.init_camera() {
-                self.error_msg = Some(e);
-                self.is_streaming = false;
+        let (width, height) = self.config.output_dimensions();
+        self.compositor = FrameCompositor::new(width, height, self.config.output_fps());
+        self.blank_frame = vec![0_u8; width as usize * height as usize * 3];
+        self.preview_texture = None;
+        self.last_main_frame = None;
+        self.last_webcam_frame = None;
+        self.preview_dirty = false;
+        self.start_selected_webcam(false);
+        self.play_current_playlist_item();
+
+        if was_streaming {
+            match self.compositor.init_camera() {
+                Ok(details) => self.set_notice(
+                    NoticeLevel::Success,
+                    "Output restarted",
+                    format!("Sending to {} through {}.", details.device, details.backend),
+                ),
+                Err(error) => {
+                    self.set_notice(NoticeLevel::Error, "Output could not restart", error)
+                }
             }
         }
-
-        self.play_current_playlist_item();
     }
 
     fn play_current_playlist_item(&mut self) {
-        if let Some(dec) = self.decoder.take() {
-            dec.stop();
+        if let Some(decoder) = self.decoder.take() {
+            decoder.stop();
         }
+        self.last_main_frame = None;
+        self.preview_texture = None;
+        self.preview_dirty = false;
 
-        let idx = match self.config.current_index {
-            Some(i) => i,
-            None => return,
+        let Some(index) = self.config.current_index else {
+            return;
         };
-
-        if idx >= self.config.playlist.len() {
+        let Some(path) = self.config.playlist.get(index).cloned() else {
+            self.config.current_index = None;
+            self.persist_config();
+            return;
+        };
+        if !path.exists() {
+            self.set_notice(
+                NoticeLevel::Error,
+                "Media is unavailable",
+                format!(
+                    "{} could not be found. Reconnect its drive or remove it from the playlist.",
+                    path.display()
+                ),
+            );
             return;
         }
+        let Some(ffmpeg) = self.ffmpeg_path.as_ref() else {
+            self.set_notice(
+                NoticeLevel::Error,
+                "FFmpeg is required",
+                "Install FFmpeg to inspect and decode playlist media.",
+            );
+            return;
+        };
+        let (width, height) = self.config.output_dimensions();
+        match MediaDecoder::new(ffmpeg, &path, width, height, self.config.output_fps()) {
+            Ok(decoder) => self.decoder = Some(decoder),
+            Err(error) => self.set_notice(NoticeLevel::Error, "Media could not load", error),
+        }
+    }
 
-        let file_path = &self.config.playlist[idx];
-        if !file_path.exists() {
-            self.error_msg = Some(format!("File not found: {:?}", file_path));
+    fn select_playlist_item(&mut self, index: usize) {
+        if index >= self.config.playlist.len() || self.config.current_index == Some(index) {
             return;
         }
+        self.config.current_index = Some(index);
+        self.persist_config();
+        self.play_current_playlist_item();
+    }
 
-        let (target_w, target_h, target_fps) = Self::get_res_fps_values(&self.config);
-        
-        if let Some(ref ffmpeg) = self.ffmpeg_path {
-            match MediaDecoder::new(ffmpeg, file_path, target_w, target_h, target_fps) {
-                Ok(dec) => {
-                    dec.play();
-                    self.decoder = Some(dec);
+    fn remove_playlist_item(&mut self, index: usize) {
+        let removed_current = self.config.current_index == Some(index);
+        if self.config.remove_media(index) {
+            self.persist_config();
+            if removed_current {
+                self.play_current_playlist_item();
+            }
+        }
+    }
+
+    fn add_media(&mut self, paths: Vec<PathBuf>) {
+        let report = self.config.add_media(paths);
+        if report.added > 0 {
+            self.persist_config();
+            if self.decoder.is_none() {
+                self.play_current_playlist_item();
+            }
+        }
+        if report.unsupported > 0 || report.duplicates > 0 {
+            self.set_notice(
+                NoticeLevel::Info,
+                "Playlist updated",
+                format!(
+                    "Added {}. Skipped {} duplicate{} and {} unsupported file{}.",
+                    report.added,
+                    report.duplicates,
+                    plural(report.duplicates),
+                    report.unsupported,
+                    plural(report.unsupported)
+                ),
+            );
+        }
+    }
+
+    fn start_stream(&mut self) {
+        self.refresh_environment();
+        let blockers = self.stream_blockers();
+        if !blockers.is_empty() {
+            self.set_notice(
+                NoticeLevel::Warning,
+                "Output is not ready",
+                blockers.join(" "),
+            );
+            return;
+        }
+        match self.compositor.init_camera() {
+            Ok(details) => self.set_notice(
+                NoticeLevel::Success,
+                "Virtual camera is live",
+                format!("Sending to {} through {}.", details.device, details.backend),
+            ),
+            Err(error) => {
+                self.refresh_environment();
+                self.set_notice(NoticeLevel::Error, "Virtual camera could not start", error);
+            }
+        }
+    }
+
+    fn stop_stream(&mut self, show_notice: bool) {
+        let was_active = self.compositor.is_active();
+        self.compositor.release();
+        if show_notice && was_active {
+            self.set_notice(
+                NoticeLevel::Info,
+                "Virtual camera stopped",
+                "Preview playback remains available inside Mimic.",
+            );
+        }
+    }
+
+    fn stream_blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if self.ffmpeg_path.is_none() {
+            blockers.push("FFmpeg is not ready.".to_string());
+        }
+        if self.virtual_camera_backends.is_empty() {
+            blockers.push("Install OBS Virtual Camera or Unity Capture.".to_string());
+        }
+        if self.config.current_index.is_none() || self.config.playlist.is_empty() {
+            blockers.push("Add and select a media file.".to_string());
+        } else if self
+            .config
+            .current_index
+            .and_then(|index| self.config.playlist.get(index))
+            .is_some_and(|path| !path.exists())
+        {
+            blockers.push("The selected media file is unavailable.".to_string());
+        }
+        if self.decoder.is_none() {
+            blockers.push("Wait for the selected media to load.".to_string());
+        }
+        blockers
+    }
+
+    fn handle_setup_messages(&mut self) {
+        while let Ok(message) = self.setup_rx.try_recv() {
+            match message {
+                SetupMessage::FfmpegProgress(progress) => self.ffmpeg_progress = progress,
+                SetupMessage::FfmpegSuccess(path) => {
+                    self.ffmpeg_path = Some(path);
+                    self.downloading_ffmpeg = false;
+                    self.refresh_webcam_list(false);
+                    self.start_selected_webcam(false);
+                    self.play_current_playlist_item();
+                    self.set_notice(
+                        NoticeLevel::Success,
+                        "FFmpeg is ready",
+                        "Media inspection and decoding are now available.",
+                    );
                 }
-                Err(e) => {
-                    self.error_msg = Some(format!("Failed to load media: {}", e));
+                SetupMessage::FfmpegFailure(error) => {
+                    self.downloading_ffmpeg = false;
+                    self.set_notice(NoticeLevel::Error, "FFmpeg setup failed", error);
+                }
+                SetupMessage::DriverProgress(progress) => self.driver_progress = progress,
+                SetupMessage::DriverSuccess => {
+                    self.installing_driver = false;
+                    self.virtual_camera_backends = setup::available_virtual_camera_backends();
+                    self.set_notice(
+                        NoticeLevel::Success,
+                        "Virtual camera is ready",
+                        "Unity Video Capture was registered successfully.",
+                    );
+                }
+                SetupMessage::DriverFailure(error) => {
+                    self.installing_driver = false;
+                    self.refresh_environment();
+                    self.set_notice(NoticeLevel::Error, "Driver setup failed", error);
                 }
             }
+        }
+    }
+
+    fn begin_ffmpeg_download(&mut self, context: &egui::Context) {
+        if self.downloading_ffmpeg {
+            return;
+        }
+        self.downloading_ffmpeg = true;
+        self.ffmpeg_progress = 0.0;
+        let sender = self.setup_tx.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let progress_context = context.clone();
+            let result = setup::download_ffmpeg(move |progress| {
+                let _ = progress_sender.send(SetupMessage::FfmpegProgress(progress));
+                progress_context.request_repaint();
+            });
+            let _ = sender.send(match result {
+                Ok(path) => SetupMessage::FfmpegSuccess(path),
+                Err(error) => SetupMessage::FfmpegFailure(error),
+            });
+            context.request_repaint();
+        });
+    }
+
+    fn begin_driver_install(&mut self, context: &egui::Context) {
+        if self.installing_driver {
+            return;
+        }
+        self.installing_driver = true;
+        self.driver_progress = 0.0;
+        let sender = self.setup_tx.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let _ = sender.send(SetupMessage::DriverProgress(0.05));
+            let progress_sender = sender.clone();
+            let progress_context = context.clone();
+            let downloaded = setup::download_driver(move |progress| {
+                let _ = progress_sender.send(SetupMessage::DriverProgress(0.05 + progress * 0.75));
+                progress_context.request_repaint();
+            });
+            let path = match downloaded {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = sender.send(SetupMessage::DriverFailure(error));
+                    context.request_repaint();
+                    return;
+                }
+            };
+            let _ = sender.send(SetupMessage::DriverProgress(0.85));
+            let message = match setup::register_driver_elevated(&path) {
+                Ok(true) => SetupMessage::DriverSuccess,
+                Ok(false) => SetupMessage::DriverFailure(
+                    "The registration process ended without confirming a device.".to_string(),
+                ),
+                Err(error) => SetupMessage::DriverFailure(error),
+            };
+            let _ = sender.send(message);
+            context.request_repaint();
+        });
+    }
+
+    fn handle_dropped_files(&mut self, context: &egui::Context) {
+        let dropped = context.input(|input| input.raw.dropped_files.clone());
+        let paths: Vec<PathBuf> = dropped.into_iter().filter_map(|file| file.path).collect();
+        if !paths.is_empty() {
+            self.add_media(paths);
+        }
+    }
+
+    fn update_runtime(&mut self, context: &egui::Context) {
+        let decoder_update = self.decoder.as_ref().map(MediaDecoder::poll);
+        if let Some(update) = decoder_update {
+            if let Some(frame) = update.latest_frame {
+                self.last_main_frame = Some(frame);
+                self.preview_dirty = true;
+            }
+            if let Some(error) = update.error {
+                if let Some(decoder) = self.decoder.take() {
+                    decoder.stop();
+                }
+                self.stop_stream(false);
+                self.set_notice(NoticeLevel::Error, "Playback stopped", error);
+            } else if update.ended {
+                if let Some(decoder) = self.decoder.take() {
+                    decoder.stop();
+                }
+                if self.config.advance_after_end() {
+                    self.persist_config();
+                    self.play_current_playlist_item();
+                } else {
+                    self.stop_stream(false);
+                    self.set_notice(
+                        NoticeLevel::Info,
+                        "Playlist complete",
+                        "Playback reached the final item. Enable playlist looping to restart automatically.",
+                    );
+                }
+            }
+        }
+
+        if let Some(capture) = self.webcam_capture.as_ref() {
+            let update = capture.poll();
+            if let Some(frame) = update.latest_frame {
+                self.last_webcam_frame = Some(frame);
+                self.preview_dirty = true;
+            }
+            if let Some(error) = update.error {
+                if let Some(capture) = self.webcam_capture.take() {
+                    capture.stop();
+                }
+                self.last_webcam_frame = None;
+                self.preview_dirty = true;
+                self.set_notice(NoticeLevel::Error, "Webcam disconnected", error);
+            }
+        }
+
+        let frame_interval = Duration::from_secs_f32(1.0 / self.config.output_fps());
+        let elapsed = self.last_frame_tick.elapsed();
+        if elapsed >= frame_interval {
+            let is_streaming = self.compositor.is_active();
+            let should_render = self.last_main_frame.is_some()
+                && (self.preview_dirty || self.preview_texture.is_none());
+            if is_streaming || should_render {
+                let main_frame = self
+                    .last_main_frame
+                    .as_deref()
+                    .unwrap_or(self.blank_frame.as_slice());
+                let pip_frame = if self.config.pip_enabled {
+                    self.webcam_capture.as_ref().and_then(|capture| {
+                        let (width, height) = capture.dimensions();
+                        self.last_webcam_frame
+                            .as_deref()
+                            .map(|frame| (frame, width, height))
+                    })
+                } else {
+                    None
+                };
+                match self.compositor.process_and_send(
+                    main_frame,
+                    pip_frame,
+                    self.config.pip_position,
+                    self.config.pip_border_radius,
+                ) {
+                    Ok(composited) if should_render => {
+                        self.update_preview_texture(context, &composited);
+                        self.preview_dirty = false;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.set_notice(NoticeLevel::Error, "Virtual camera output failed", error)
+                    }
+                }
+            }
+            self.last_frame_tick = Instant::now();
+        }
+        context
+            .request_repaint_after(frame_interval.saturating_sub(self.last_frame_tick.elapsed()));
+    }
+
+    fn update_preview_texture(&mut self, context: &egui::Context, frame: &[u8]) {
+        let (width, height) = self.config.output_dimensions();
+        let image = egui::ColorImage::from_rgb([width as usize, height as usize], frame);
+        if let Some(texture) = self.preview_texture.as_mut() {
+            texture.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            self.preview_texture = Some(context.load_texture(
+                "mimic-live-preview",
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+    }
+
+    fn show_top_bar(&mut self, context: &egui::Context) {
+        egui::TopBottomPanel::top("top_bar")
+            .exact_height(54.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(17, 19, 24))
+                    .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+                    .stroke(egui::Stroke::new(1.0, BORDER)),
+            )
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("MIMIC").size(20.0).strong().color(TEXT));
+                    ui.label(egui::RichText::new("Virtual camera studio").color(MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (label, color) = if self.compositor.is_active() {
+                            ("LIVE OUTPUT", SUCCESS)
+                        } else if self.virtual_camera_backends.is_empty() {
+                            ("SETUP NEEDED", WARNING)
+                        } else {
+                            ("BACKEND READY", ACCENT)
+                        };
+                        status_badge(ui, label, color);
+                        if let Some(details) = self.compositor.camera_details() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} / {}",
+                                    details.device, details.backend
+                                ))
+                                .small()
+                                .color(MUTED),
+                            );
+                        }
+                    });
+                });
+            });
+    }
+
+    fn show_setup_banner(&mut self, context: &egui::Context) {
+        if self.ffmpeg_path.is_some() && !self.virtual_camera_backends.is_empty() {
+            return;
+        }
+        egui::TopBottomPanel::top("setup_banner")
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(40, 31, 20))
+                    .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(93, 68, 31))),
+            )
+            .show(context, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Finish setup").strong().color(WARNING));
+                    if self.ffmpeg_path.is_none() {
+                        ui.label(egui::RichText::new("FFmpeg is required for media playback.").color(TEXT));
+                        if self.downloading_ffmpeg {
+                            ui.add(
+                                egui::ProgressBar::new(self.ffmpeg_progress)
+                                    .desired_width(170.0)
+                                    .text(format!("FFmpeg {:.0}%", self.ffmpeg_progress * 100.0)),
+                            );
+                        } else if ui.button("Install verified FFmpeg").clicked() {
+                            self.begin_ffmpeg_download(context);
+                        }
+                    }
+                    if self.virtual_camera_backends.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "Install OBS Virtual Camera or the verified Unity Capture driver for output.",
+                            )
+                            .color(TEXT),
+                        );
+                        if self.installing_driver {
+                            ui.add(
+                                egui::ProgressBar::new(self.driver_progress)
+                                    .desired_width(190.0)
+                                    .text(if self.driver_progress >= 0.85 {
+                                        "Waiting for administrator approval"
+                                    } else {
+                                        "Preparing Unity Capture"
+                                    }),
+                            );
+                        } else if ui.button("Install Unity Capture").clicked() {
+                            self.begin_driver_install(context);
+                        }
+                    }
+                    if !self.downloading_ffmpeg
+                        && !self.installing_driver
+                        && ui.button("Refresh detection").clicked()
+                    {
+                        self.refresh_setup();
+                    }
+                });
+            });
+    }
+
+    fn show_left_panel(&mut self, context: &egui::Context) {
+        egui::SidePanel::left("controls")
+            .exact_width(278.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::same(16.0))
+                    .stroke(egui::Stroke::new(1.0, BORDER)),
+            )
+            .show(context, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    section_heading(ui, "OUTPUT");
+                    card(ui, |ui| self.show_output_controls(ui));
+                    ui.add_space(16.0);
+                    section_heading(ui, "CAMERA OVERLAY");
+                    card(ui, |ui| self.show_webcam_controls(ui));
+                });
+            });
+    }
+
+    fn show_output_controls(&mut self, ui: &mut egui::Ui) {
+        let streaming = self.compositor.is_active();
+        if streaming {
+            if ui
+                .add_sized(
+                    [ui.available_width(), 38.0],
+                    egui::Button::new(egui::RichText::new("Stop virtual camera").strong())
+                        .fill(egui::Color32::from_rgb(122, 42, 49)),
+                )
+                .clicked()
+            {
+                self.stop_stream(true);
+            }
+        } else {
+            let blockers = self.stream_blockers();
+            let response = ui.add_enabled(
+                blockers.is_empty(),
+                egui::Button::new(egui::RichText::new("Start virtual camera").strong())
+                    .fill(egui::Color32::from_rgb(36, 106, 178))
+                    .min_size(egui::vec2(ui.available_width(), 38.0)),
+            );
+            if response.clicked() {
+                self.start_stream();
+            }
+            if let Some(blocker) = blockers.first() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(blocker).small().color(MUTED));
+            }
+        }
+
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new("Format").strong().color(TEXT));
+        let old_resolution = self.config.output_resolution_index;
+        let old_fps = self.config.output_fps_index;
+        ui.add_enabled_ui(!streaming, |ui| {
+            egui::ComboBox::from_id_source("resolution")
+                .selected_text(match self.config.output_resolution_index {
+                    1 => "1920 × 1080",
+                    2 => "640 × 480",
+                    _ => "1280 × 720",
+                })
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.config.output_resolution_index, 0, "1280 × 720");
+                    ui.selectable_value(&mut self.config.output_resolution_index, 1, "1920 × 1080");
+                    ui.selectable_value(&mut self.config.output_resolution_index, 2, "640 × 480");
+                });
+            egui::ComboBox::from_id_source("frame_rate")
+                .selected_text(if self.config.output_fps_index == 1 {
+                    "60 frames per second"
+                } else {
+                    "30 frames per second"
+                })
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.config.output_fps_index,
+                        0,
+                        "30 frames per second",
+                    );
+                    ui.selectable_value(
+                        &mut self.config.output_fps_index,
+                        1,
+                        "60 frames per second",
+                    );
+                });
+        });
+        if old_resolution != self.config.output_resolution_index
+            || old_fps != self.config.output_fps_index
+        {
+            self.persist_config();
+            self.rebuild_pipeline();
+        }
+        if streaming {
+            ui.label(
+                egui::RichText::new("Stop output to change format.")
+                    .small()
+                    .color(MUTED),
+            );
+        }
+
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("Detected output").strong().color(TEXT));
+        if self.virtual_camera_backends.is_empty() {
+            ui.label(egui::RichText::new("No backend detected").color(WARNING));
+        } else {
+            for backend in &self.virtual_camera_backends {
+                ui.label(egui::RichText::new(backend.label()).color(SUCCESS));
+            }
+        }
+    }
+
+    fn show_webcam_controls(&mut self, ui: &mut egui::Ui) {
+        let enabled_response = ui.add_enabled(
+            self.ffmpeg_path.is_some(),
+            egui::Checkbox::new(&mut self.config.pip_enabled, "Enable picture-in-picture"),
+        );
+        if enabled_response.changed() {
+            self.persist_config();
+            self.start_selected_webcam(true);
+        }
+        if !self.config.pip_enabled {
+            ui.label(
+                egui::RichText::new("Add a physical camera over the selected media.")
+                    .small()
+                    .color(MUTED),
+            );
+            return;
+        }
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Source").strong().color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Refresh").clicked() {
+                    self.refresh_webcam_list(true);
+                }
+            });
+        });
+        let selected_text = self
+            .config
+            .selected_webcam
+            .as_deref()
+            .unwrap_or("Choose a camera");
+        let mut selected_camera = None;
+        egui::ComboBox::from_id_source("physical_camera")
+            .selected_text(selected_text)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                if self.available_webcams.is_empty() {
+                    ui.label(egui::RichText::new("No cameras detected").color(MUTED));
+                }
+                for camera in &self.available_webcams {
+                    if ui
+                        .selectable_label(
+                            self.config.selected_webcam.as_ref() == Some(camera),
+                            camera,
+                        )
+                        .clicked()
+                    {
+                        selected_camera = Some(camera.clone());
+                    }
+                }
+            });
+        if let Some(camera) = selected_camera {
+            self.config.selected_webcam = Some(camera);
+            self.persist_config();
+            self.start_selected_webcam(false);
+        }
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Placement").strong().color(TEXT));
+        let previous_position = self.config.pip_position;
+        egui::ComboBox::from_id_source("pip_position")
+            .selected_text(pip_position_label(self.config.pip_position))
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.config.pip_position,
+                    PipPosition::TopLeft,
+                    "Top left",
+                );
+                ui.selectable_value(
+                    &mut self.config.pip_position,
+                    PipPosition::TopRight,
+                    "Top right",
+                );
+                ui.selectable_value(
+                    &mut self.config.pip_position,
+                    PipPosition::BottomLeft,
+                    "Bottom left",
+                );
+                ui.selectable_value(
+                    &mut self.config.pip_position,
+                    PipPosition::BottomRight,
+                    "Bottom right",
+                );
+            });
+        if previous_position != self.config.pip_position {
+            self.persist_config();
+            self.preview_dirty = true;
+        }
+
+        let scale_response = ui.add(
+            egui::Slider::new(&mut self.config.pip_scale, 0.15..=0.45)
+                .text("Size")
+                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+        );
+        if scale_response.changed() {
+            self.persist_config();
+        }
+        if scale_response.drag_stopped() || (scale_response.changed() && !scale_response.dragged())
+        {
+            self.start_selected_webcam(false);
+        }
+        if ui
+            .add(
+                egui::Slider::new(&mut self.config.pip_border_radius, 0..=96).text("Corner radius"),
+            )
+            .changed()
+        {
+            self.persist_config();
+            self.preview_dirty = true;
+        }
+    }
+
+    fn show_playlist(&mut self, context: &egui::Context) {
+        egui::SidePanel::right("playlist")
+            .exact_width(252.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::same(14.0))
+                    .stroke(egui::Stroke::new(1.0, BORDER)),
+            )
+            .show(context, |ui| {
+                section_heading(ui, "PLAYLIST");
+                ui.add_space(6.0);
+                if ui
+                    .add_sized([ui.available_width(), 32.0], egui::Button::new("Add media"))
+                    .clicked()
+                {
+                    let files = FileDialog::new()
+                        .add_filter("Supported media", MEDIA_EXTENSIONS)
+                        .pick_files();
+                    if let Some(files) = files {
+                        self.add_media(files);
+                    }
+                }
+                ui.add_space(10.0);
+
+                if self.config.playlist.is_empty() {
+                    let available = ui.available_size();
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(available.x, available.y.max(220.0)),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(70.0);
+                            ui.label(egui::RichText::new("No media yet").strong().color(TEXT));
+                            ui.label(
+                                egui::RichText::new(
+                                    "Drop files onto the preview\nor use Add media.",
+                                )
+                                .color(MUTED),
+                            );
+                        },
+                    );
+                    return;
+                }
+
+                let mut selected = None;
+                let mut removed = None;
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (index, path) in self.config.playlist.clone().iter().enumerate() {
+                        let active = self.config.current_index == Some(index);
+                        let exists = path.exists();
+                        let fill = if active {
+                            egui::Color32::from_rgb(28, 52, 78)
+                        } else {
+                            CARD
+                        };
+                        egui::Frame::none()
+                            .fill(fill)
+                            .rounding(7.0)
+                            .inner_margin(egui::Margin::same(9.0))
+                            .stroke(egui::Stroke::new(1.0, if active { ACCENT } else { BORDER }))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let color = if exists { TEXT } else { DANGER };
+                                    let name = path
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("Unnamed media");
+                                    let name_width = (ui.available_width() - 72.0).max(60.0);
+                                    let label = ui
+                                        .add_sized(
+                                            [name_width, 24.0],
+                                            egui::SelectableLabel::new(
+                                                active,
+                                                egui::RichText::new(name).color(color),
+                                            ),
+                                        )
+                                        .on_hover_text(path.display().to_string());
+                                    if label.clicked() {
+                                        selected = Some(index);
+                                    }
+                                    if ui.small_button("Remove").clicked() {
+                                        removed = Some(index);
+                                    }
+                                });
+                                if !exists {
+                                    ui.label(
+                                        egui::RichText::new("File unavailable")
+                                            .small()
+                                            .color(DANGER),
+                                    );
+                                }
+                            });
+                        ui.add_space(7.0);
+                    }
+                });
+                if let Some(index) = selected {
+                    self.select_playlist_item(index);
+                }
+                if let Some(index) = removed {
+                    self.remove_playlist_item(index);
+                }
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} item{}",
+                        self.config.playlist.len(),
+                        plural(self.config.playlist.len())
+                    ))
+                    .small()
+                    .color(MUTED),
+                );
+            });
+    }
+
+    fn show_transport(&mut self, context: &egui::Context) {
+        egui::TopBottomPanel::bottom("transport")
+            .exact_height(86.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+                    .stroke(egui::Stroke::new(1.0, BORDER)),
+            )
+            .show(context, |ui| {
+                let current_time = self
+                    .decoder
+                    .as_ref()
+                    .map(MediaDecoder::current_time)
+                    .unwrap_or(Duration::ZERO);
+                let duration = self
+                    .decoder
+                    .as_ref()
+                    .map(|decoder| decoder.metadata().duration)
+                    .unwrap_or(Duration::ZERO);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format_time(current_time))
+                            .monospace()
+                            .color(MUTED),
+                    );
+                    let mut seek = self.seek_drag_value.unwrap_or(current_time.as_secs_f32());
+                    let slider =
+                        egui::Slider::new(&mut seek, 0.0..=duration.as_secs_f32().max(0.01))
+                            .show_value(false);
+                    let response =
+                        ui.add_enabled(self.decoder.is_some() && !duration.is_zero(), slider);
+                    if response.dragged() {
+                        self.seek_drag_value = Some(seek);
+                    }
+                    if response.drag_stopped() || (response.changed() && !response.dragged()) {
+                        if let Some(decoder) = self.decoder.as_ref() {
+                            decoder.seek(Duration::from_secs_f32(seek));
+                        }
+                        self.seek_drag_value = None;
+                    }
+                    ui.label(
+                        egui::RichText::new(format_time(duration))
+                            .monospace()
+                            .color(MUTED),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let current = self.config.current_index;
+                    if ui
+                        .add_enabled(
+                            current.is_some_and(|index| index > 0),
+                            egui::Button::new("Previous"),
+                        )
+                        .clicked()
+                        && let Some(index) = current
+                    {
+                        self.config.current_index = Some(index - 1);
+                        self.persist_config();
+                        self.play_current_playlist_item();
+                    }
+
+                    let paused = self.decoder.as_ref().is_some_and(MediaDecoder::is_paused);
+                    let finished = self.decoder.as_ref().is_some_and(MediaDecoder::is_finished);
+                    let play_label = if self.decoder.is_none() || paused || finished {
+                        "Play"
+                    } else {
+                        "Pause"
+                    };
+                    if ui
+                        .add_enabled(
+                            self.config.current_index.is_some(),
+                            egui::Button::new(play_label),
+                        )
+                        .clicked()
+                    {
+                        if let Some(decoder) = self.decoder.as_ref() {
+                            if paused {
+                                decoder.play();
+                            } else {
+                                decoder.pause();
+                            }
+                        } else {
+                            self.play_current_playlist_item();
+                        }
+                    }
+
+                    if ui
+                        .add_enabled(
+                            current.is_some_and(|index| index + 1 < self.config.playlist.len()),
+                            egui::Button::new("Next"),
+                        )
+                        .clicked()
+                        && let Some(index) = current
+                    {
+                        self.config.current_index = Some(index + 1);
+                        self.persist_config();
+                        self.play_current_playlist_item();
+                    }
+                    ui.separator();
+                    if ui
+                        .checkbox(&mut self.config.loop_playlist, "Loop playlist")
+                        .changed()
+                    {
+                        self.persist_config();
+                    }
+                });
+            });
+    }
+
+    fn show_workspace(&mut self, context: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BACKGROUND).inner_margin(18.0))
+            .show(context, |ui| {
+                self.show_notice(ui);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Preview").size(18.0).strong().color(TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if self.decoder.is_some() {
+                            if self.decoder.as_ref().is_some_and(MediaDecoder::is_paused) {
+                                "PAUSED"
+                            } else {
+                                "PLAYING"
+                            }
+                        } else {
+                            "IDLE"
+                        };
+                        status_badge(ui, label, if self.decoder.is_some() { ACCENT } else { MUTED });
+                    });
+                });
+                ui.add_space(10.0);
+
+                let (width, height) = self.config.output_dimensions();
+                let aspect = width as f32 / height as f32;
+                let available = ui.available_size();
+                let canvas_width = available.x;
+                let canvas_height = canvas_width / aspect;
+                let size = if canvas_height > available.y - 44.0 {
+                    egui::vec2((available.y - 44.0).max(120.0) * aspect, (available.y - 44.0).max(120.0))
+                } else {
+                    egui::vec2(canvas_width, canvas_height)
+                };
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 9.0, egui::Color32::from_rgb(7, 9, 12));
+                    if context.input(|input| !input.raw.hovered_files.is_empty()) {
+                        ui.painter().rect_filled(
+                            rect,
+                            9.0,
+                            egui::Color32::from_rgba_unmultiplied(31, 103, 172, 215),
+                        );
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Drop media to add it to the playlist",
+                            egui::FontId::proportional(17.0),
+                            egui::Color32::WHITE,
+                        );
+                    } else if self.last_main_frame.is_some() {
+                        if let Some(texture) = self.preview_texture.as_ref() {
+                            ui.painter().image(
+                                texture.id(),
+                                rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            draw_empty_preview(ui, rect, "Preparing preview", "Decoding the first frame…");
+                        }
+                    } else if self.config.current_index.is_some() && self.decoder.is_some() {
+                        draw_empty_preview(ui, rect, "Preparing preview", "Decoding the first frame…");
+                    } else {
+                        draw_empty_preview(
+                            ui,
+                            rect,
+                            "Build your camera scene",
+                            "Add a video or image, then start the virtual camera when output is ready.",
+                        );
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(index) = self.config.current_index
+                        && let Some(path) = self.config.playlist.get(index)
+                    {
+                        ui.label(
+                            egui::RichText::new(
+                                path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("Selected media"),
+                            )
+                            .strong()
+                            .color(if path.exists() { TEXT } else { DANGER }),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new("No media selected").color(MUTED));
+                    }
+                    if let Some(decoder) = self.decoder.as_ref() {
+                        let metadata = decoder.metadata();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} × {} source · {:.2} fps · {} output",
+                                metadata.width,
+                                metadata.height,
+                                metadata.fps,
+                                if self.config.output_fps_index == 1 { "60 fps" } else { "30 fps" }
+                            ))
+                            .small()
+                            .color(MUTED),
+                        );
+                    }
+                });
+            });
+    }
+
+    fn show_notice(&mut self, ui: &mut egui::Ui) {
+        let Some(notice) = self.notice.clone() else {
+            return;
+        };
+        let color = match notice.level {
+            NoticeLevel::Info => ACCENT,
+            NoticeLevel::Success => SUCCESS,
+            NoticeLevel::Warning => WARNING,
+            NoticeLevel::Error => DANGER,
+        };
+        let mut dismiss = false;
+        egui::Frame::none()
+            .fill(color.gamma_multiply(0.12))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+            .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.7)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(&notice.title).strong().color(color));
+                        ui.label(egui::RichText::new(&notice.message).color(TEXT));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Dismiss").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            });
+        ui.add_space(10.0);
+        if dismiss {
+            self.notice = None;
         }
     }
 }
 
 impl eframe::App for MimicApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Process background setup messages
-        while let Ok(msg) = self.setup_rx.try_recv() {
-            match msg {
-                SetupMessage::FfmpegProgress(p) => {
-                    self.ffmpeg_progress = p;
-                }
-                SetupMessage::FfmpegSuccess(path) => {
-                    self.ffmpeg_path = Some(path);
-                    self.downloading_ffmpeg = false;
-                }
-                SetupMessage::FfmpegFailure(err) => {
-                    self.error_msg = Some(format!("FFmpeg download failed: {}", err));
-                    self.downloading_ffmpeg = false;
-                }
-                SetupMessage::DriverProgress(p) => {
-                    self.driver_progress = p;
-                }
-                SetupMessage::DriverSuccess(_path) => {
-                    self.driver_registered = true;
-                    self.downloading_driver = false;
-                }
-                SetupMessage::DriverFailure(err) => {
-                    self.error_msg = Some(format!("Driver installation failed: {}", err));
-                    self.downloading_driver = false;
-                }
-            }
-        }
-
-        // Request continuous rendering for live video playback
-        ctx.request_repaint();
-
-        // 1. Process new video/image frames & webcam frames
-        let mut main_frame_data: Option<Vec<u8>> = None;
-        let mut current_pos = Duration::ZERO;
-        let mut duration = Duration::ZERO;
-
-        if let Some(ref dec) = self.decoder {
-            if let Some(frame) = dec.next_frame() {
-                main_frame_data = Some(frame.data);
-            } else if let Some(ref last) = self.last_composited_frame {
-                // If decoder hasn't produced a new frame, keep displaying last frame
-                main_frame_data = Some(last.clone());
-            }
-            current_pos = dec.current_time();
-            duration = dec.metadata().duration;
-        } else {
-            // Draw a black screen if no media is playing
-            let (w, h, _) = Self::get_res_fps_values(&self.config);
-            main_frame_data = Some(vec![0u8; (w * h * 3) as usize]);
-        }
-
-        let mut webcam_frame: Option<Vec<u8>> = None;
-        if self.config.pip_enabled {
-            if let Some(ref wc) = self.webcam_capture {
-                if let Some(frame) = wc.next_frame() {
-                    webcam_frame = Some(frame);
-                }
-            }
-        }
-
-        // Composite main frame + PIP overlay
-        if let Some(ref main_bytes) = main_frame_data {
-            let pip_frame_opt = if let Some(ref web_bytes) = webcam_frame {
-                // PIP is at 320x240
-                Some((web_bytes.as_slice(), 320u32, 240u32))
-            } else {
-                None
-            };
-            
-            let composited = self.compositor.process_and_send(
-                main_bytes,
-                pip_frame_opt,
-                self.config.pip_position,
-                self.config.pip_border_radius,
-            );
-
-            // Re-upload to GPU texture for live preview canvas
-            let (target_w, target_h, _) = Self::get_res_fps_values(&self.config);
-            let mut preview_image = egui::ColorImage::new([target_w as usize, target_h as usize], egui::Color32::BLACK);
-            
-            for (i, rgb) in composited.chunks_exact(3).enumerate() {
-                if i < preview_image.pixels.len() {
-                    preview_image.pixels[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                }
-            }
-
-            self.preview_texture = Some(ctx.load_texture(
-                "live_preview",
-                preview_image,
-                egui::TextureOptions::LINEAR,
-            ));
-            
-            self.last_composited_frame = Some(composited);
-        }
-
-        // 2. Drag & Drop file listener
-        if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
-            ctx.request_repaint(); // Redraw immediately to show drop indicator
-        }
-
-        if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
-            let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-            for f in dropped {
-                if let Some(path) = f.path {
-                    self.config.playlist.push(path);
-                    self.save_config();
-                }
-            }
-            if self.config.current_index.is_none() && !self.config.playlist.is_empty() {
-                self.config.current_index = Some(0);
-                self.play_current_playlist_item();
-            }
-        }
-
-        // 3. Layout Rendering
-        egui::TopBottomPanel::top("top_bar").frame(egui::Frame::none().fill(egui::Color32::from_rgb(15, 15, 20)).inner_margin(8.0)).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("⚡ Mimic");
-                ui.label("• Virtual Webcam Simulator");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Status Badge
-                    if self.is_streaming {
-                        ui.colored_label(egui::Color32::from_rgb(50, 220, 100), "● STREAMING ACTIVE");
-                    } else {
-                        ui.colored_label(egui::Color32::from_rgb(220, 100, 50), "○ STANDBY");
-                    }
-                });
-            });
-        });
-
-        // Setup guide warning banners if dependencies are missing
-        if self.ffmpeg_path.is_none() || !self.driver_registered {
-            egui::TopBottomPanel::top("setup_banner").frame(egui::Frame::none().fill(egui::Color32::from_rgb(40, 20, 20)).inner_margin(12.0)).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("⚠️");
-                    ui.vertical(|ui| {
-                        if self.ffmpeg_path.is_none() {
-                            ui.horizontal(|ui| {
-                                ui.label("FFmpeg is required to decode video. ");
-                                if self.downloading_ffmpeg {
-                                    ui.add(egui::ProgressBar::new(self.ffmpeg_progress).text(format!("Downloading... {:.0}%", self.ffmpeg_progress * 100.0)));
-                                } else {
-                                    if ui.button("Download FFmpeg Automatically").clicked() {
-                                        self.downloading_ffmpeg = true;
-                                        self.ffmpeg_progress = 0.0;
-                                        let tx = self.setup_tx.clone();
-                                        let ctx_clone = ctx.clone();
-                                        thread::spawn(move || {
-                                            let tx_progress = tx.clone();
-                                            let ctx_progress = ctx_clone.clone();
-                                            let res = setup::download_ffmpeg(move |progress| {
-                                                let _ = tx_progress.send(SetupMessage::FfmpegProgress(progress));
-                                                ctx_progress.request_repaint();
-                                            });
-                                            match res {
-                                                Ok(path) => {
-                                                    let _ = tx.send(SetupMessage::FfmpegSuccess(path));
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx.send(SetupMessage::FfmpegFailure(e));
-                                                }
-                                            }
-                                            ctx_clone.request_repaint();
-                                        });
-                                    }
-                                }
-                            });
-                        }
-                        if !self.driver_registered {
-                            ui.horizontal(|ui| {
-                                ui.label("Virtual Camera driver is not registered. ");
-                                if self.downloading_driver {
-                                    ui.add(egui::ProgressBar::new(self.driver_progress).text(format!("Registering... {:.0}%", self.driver_progress * 100.0)));
-                                } else {
-                                    if ui.button("Install & Register Virtual Camera (Unity Capture)").clicked() {
-                                        self.downloading_driver = true;
-                                        self.driver_progress = 0.0;
-                                        let tx = self.setup_tx.clone();
-                                        let ctx_clone = ctx.clone();
-                                        thread::spawn(move || {
-                                            let _ = tx.send(SetupMessage::DriverProgress(0.1));
-                                            ctx_clone.request_repaint();
-                                            
-                                            let tx_progress = tx.clone();
-                                            let ctx_progress = ctx_clone.clone();
-                                            let res = setup::download_driver(move |progress| {
-                                                let scaled = 0.1 + progress * 0.7;
-                                                let _ = tx_progress.send(SetupMessage::DriverProgress(scaled));
-                                                ctx_progress.request_repaint();
-                                            });
-                                            
-                                            let dll_path = match res {
-                                                Ok(path) => path,
-                                                Err(e) => {
-                                                    let _ = tx.send(SetupMessage::DriverFailure(e));
-                                                    ctx_clone.request_repaint();
-                                                    return;
-                                                }
-                                            };
-                                            
-                                            let _ = tx.send(SetupMessage::DriverProgress(0.9));
-                                            ctx_clone.request_repaint();
-                                            
-                                            match setup::register_driver_elevated(&dll_path) {
-                                                Ok(_) => {
-                                                    let _ = tx.send(SetupMessage::DriverSuccess(dll_path));
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx.send(SetupMessage::DriverFailure(e));
-                                                }
-                                            }
-                                            ctx_clone.request_repaint();
-                                        });
-                                    }
-                                }
-                            });
-                        }
-                    });
-                });
-            });
-        }
-
-        // Left sidebar for parameters & webcam overlay controls
-        egui::SidePanel::left("left_sidebar").width_range(250.0..=300.0).frame(egui::Frame::none().fill(egui::Color32::from_rgb(25, 25, 30)).inner_margin(16.0)).show(ctx, |ui| {
-            ui.heading("Configuration");
-            ui.add_space(8.0);
-            
-            // Output device control
-            ui.group(|ui| {
-                ui.label("🖥️ OUTPUT STREAM");
-                let btn_text = if self.is_streaming { "STOP VIRTUAL CAMERA" } else { "START VIRTUAL CAMERA" };
-                let color = if self.is_streaming { egui::Color32::from_rgb(200, 50, 50) } else { egui::Color32::from_rgb(50, 150, 250) };
-                
-                if ui.add(egui::Button::new(btn_text).fill(color).min_size(egui::vec2(ui.available_width(), 32.0))).clicked() {
-                    if self.is_streaming {
-                        self.compositor.release();
-                        self.is_streaming = false;
-                    } else {
-                        self.driver_registered = setup::is_driver_registered();
-                        if !self.driver_registered {
-                            self.error_msg = Some("Driver not installed! Please click the top banner installer first.".to_string());
-                        } else {
-                            match self.compositor.init_camera() {
-                                Ok(_) => self.is_streaming = true,
-                                Err(e) => self.error_msg = Some(e),
-                            }
-                        }
-                    }
-                }
-                
-                ui.add_space(8.0);
-                ui.label("Resolution:");
-                let res_prev = match self.config.output_resolution_index {
-                    1 => "1920x1080 (1080p)",
-                    2 => "640x480 (VGA)",
-                    _ => "1280x720 (720p)",
-                };
-                
-                egui::ComboBox::from_id_source("res_combo").selected_text(res_prev).show_ui(ui, |ui| {
-                    if ui.selectable_value(&mut self.config.output_resolution_index, 0, "1280x720 (720p)").changed() {
-                        self.save_config();
-                        self.update_pipeline_dimensions();
-                    }
-                    if ui.selectable_value(&mut self.config.output_resolution_index, 1, "1920x1080 (1080p)").changed() {
-                        self.save_config();
-                        self.update_pipeline_dimensions();
-                    }
-                    if ui.selectable_value(&mut self.config.output_resolution_index, 2, "640x480 (VGA)").changed() {
-                        self.save_config();
-                        self.update_pipeline_dimensions();
-                    }
-                });
-
-                ui.add_space(4.0);
-                ui.label("Frame Rate:");
-                let fps_prev = match self.config.output_fps_index {
-                    1 => "60 FPS",
-                    _ => "30 FPS",
-                };
-                
-                egui::ComboBox::from_id_source("fps_combo").selected_text(fps_prev).show_ui(ui, |ui| {
-                    if ui.selectable_value(&mut self.config.output_fps_index, 0, "30 FPS").changed() {
-                        self.save_config();
-                        self.update_pipeline_dimensions();
-                    }
-                    if ui.selectable_value(&mut self.config.output_fps_index, 1, "60 FPS").changed() {
-                        self.save_config();
-                        self.update_pipeline_dimensions();
-                    }
-                });
-            });
-            
-            ui.add_space(12.0);
-
-            // Webcam PIP Config
-            ui.group(|ui| {
-                ui.label("📷 PHYSICAL WEBCAM (PIP)");
-                if ui.checkbox(&mut self.config.pip_enabled, "Overlay Physical Camera").changed() {
-                    self.save_config();
-                    self.start_selected_webcam();
-                }
-                
-                if self.config.pip_enabled {
-                    ui.add_space(6.0);
-                    ui.label("Webcam source:");
-                    
-                    let webcam_prev = self.config.selected_webcam.clone().unwrap_or_else(|| "Select device...".to_string());
-                    
-                    ui.horizontal(|ui| {
-                        let available_webcams = self.available_webcams.clone();
-                        let current_selected = self.config.selected_webcam.clone();
-                        egui::ComboBox::from_id_source("webcam_combo").selected_text(&webcam_prev).show_ui(ui, |ui| {
-                            for cam in &available_webcams {
-                                if ui.selectable_label(current_selected.as_ref() == Some(cam), cam).clicked() {
-                                    self.config.selected_webcam = Some(cam.clone());
-                                    self.save_config();
-                                    self.start_selected_webcam();
-                                }
-                            }
-                        });
-                        
-                        if ui.button("🔄").on_hover_text("Refresh device list").clicked() {
-                            self.refresh_webcam_list();
-                        }
-                    });
-
-                    ui.add_space(6.0);
-                    ui.label("Position Corner:");
-                    
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(self.config.pip_position == PipPosition::TopLeft, "↖").clicked() {
-                            self.config.pip_position = PipPosition::TopLeft;
-                            self.save_config();
-                        }
-                        if ui.selectable_label(self.config.pip_position == PipPosition::TopRight, "↗").clicked() {
-                            self.config.pip_position = PipPosition::TopRight;
-                            self.save_config();
-                        }
-                        if ui.selectable_label(self.config.pip_position == PipPosition::BottomLeft, "↙").clicked() {
-                            self.config.pip_position = PipPosition::BottomLeft;
-                            self.save_config();
-                        }
-                        if ui.selectable_label(self.config.pip_position == PipPosition::BottomRight, "↘").clicked() {
-                            self.config.pip_position = PipPosition::BottomRight;
-                            self.save_config();
-                        }
-                    });
-
-                    ui.add_space(6.0);
-                    ui.label("Corner Rounded Radius:");
-                    if ui.add(egui::Slider::new(&mut self.config.pip_border_radius, 0..=30).text("px")).changed() {
-                        self.save_config();
-                    }
-                }
-            });
-
-            // Display error box if present
-            let mut dismiss_error = false;
-            if let Some(ref err) = self.error_msg {
-                ui.add_space(16.0);
-                ui.group(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(240, 80, 80), "⚠️ Error:");
-                    ui.label(err);
-                    if ui.small_button("Dismiss").clicked() {
-                        dismiss_error = true;
-                    }
-                });
-            }
-            if dismiss_error {
-                self.error_msg = None;
-            }
-        });
-
-        // Right sidebar for Playlist Management
-        egui::SidePanel::right("right_sidebar").width_range(200.0..=250.0).frame(egui::Frame::none().fill(egui::Color32::from_rgb(25, 25, 30)).inner_margin(16.0)).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("🎬 Playlist");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("➕ Add").clicked() {
-                        let files = FileDialog::new()
-                            .add_filter("Multimedia", &["mp4", "mkv", "avi", "mov", "gif", "png", "jpg", "jpeg"])
-                            .pick_files();
-                        if let Some(picked) = files {
-                            for p in picked {
-                                self.config.playlist.push(p);
-                            }
-                            self.save_config();
-                            if self.config.current_index.is_none() && !self.config.playlist.is_empty() {
-                                self.config.current_index = Some(0);
-                                self.play_current_playlist_item();
-                            }
-                        }
-                    }
-                });
-            });
-
-            ui.add_space(8.0);
-            
-            // Scrollable list
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if self.config.playlist.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("Drag files here\nor click Add to start.");
-                    });
-                } else {
-                    let mut to_delete = None;
-                    let playlist = self.config.playlist.clone();
-                    let current_index = self.config.current_index;
-                    for (i, path) in playlist.iter().enumerate() {
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Unknown File");
-                        let is_active = current_index == Some(i);
-                        
-                        ui.horizontal(|ui| {
-                            let _text_color = if is_active {
-                                egui::Color32::from_rgb(50, 180, 250)
-                            } else {
-                                egui::Color32::from_rgb(180, 180, 180)
-                            };
-                            
-                            let label = ui.selectable_label(is_active, name);
-                            if label.clicked() {
-                                self.config.current_index = Some(i);
-                                self.save_config();
-                                self.play_current_playlist_item();
-                            }
-                            
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("❌").clicked() {
-                                    to_delete = Some(i);
-                                }
-                            });
-                        });
-                        ui.separator();
-                    }
-
-                    if let Some(del_idx) = to_delete {
-                        self.config.playlist.remove(del_idx);
-                        if self.config.playlist.is_empty() {
-                            self.config.current_index = None;
-                            if let Some(dec) = self.decoder.take() {
-                                dec.stop();
-                            }
-                        } else if self.config.current_index == Some(del_idx) {
-                            self.config.current_index = Some(del_idx.min(self.config.playlist.len() - 1));
-                            self.play_current_playlist_item();
-                        } else if let Some(curr) = self.config.current_index {
-                            if curr > del_idx {
-                                self.config.current_index = Some(curr - 1);
-                            }
-                        }
-                        self.save_config();
-                    }
-                }
-            });
-        });
-
-        // Bottom control timeline bar
-        egui::TopBottomPanel::bottom("bottom_bar").frame(egui::Frame::none().fill(egui::Color32::from_rgb(25, 25, 30)).inner_margin(16.0)).show(ctx, |ui| {
-            // Timeline Seeker
-            ui.horizontal(|ui| {
-                let current_sec = current_pos.as_secs_f32();
-                let duration_sec = duration.as_secs_f32();
-                
-                ui.label(format!(
-                    "{:02}:{:02}",
-                    (current_sec / 60.0) as i32,
-                    (current_sec % 60.0) as i32
-                ));
-                
-                let mut seek_val = current_sec;
-                let slider = egui::Slider::new(&mut seek_val, 0.0..=duration_sec).show_value(false);
-                let response = ui.add_sized(egui::vec2(ui.available_width() - 80.0, 16.0), slider);
-                
-                if response.drag_started() {
-                    self.seek_drag_val = Some(seek_val);
-                } else if response.drag_stopped() {
-                    if let Some(s) = self.seek_drag_val {
-                        if let Some(ref dec) = self.decoder {
-                            dec.seek(Duration::from_secs_f32(s));
-                        }
-                    }
-                    self.seek_drag_val = None;
-                } else if response.dragged() {
-                    self.seek_drag_val = Some(seek_val);
-                }
-                
-                ui.label(format!(
-                    "{:02}:{:02}",
-                    (duration_sec / 60.0) as i32,
-                    (duration_sec % 60.0) as i32
-                ));
-            });
-
-            ui.add_space(4.0);
-
-            // Controls (Pause, Play, Previous, Next, Loop)
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if ui.button("⏮").on_hover_text("Previous").clicked() {
-                        if let Some(curr) = self.config.current_index {
-                            if curr > 0 {
-                                self.config.current_index = Some(curr - 1);
-                                self.save_config();
-                                self.play_current_playlist_item();
-                            }
-                        }
-                    }
-                    
-                    let play_pause_icon = if let Some(ref dec) = self.decoder {
-                        if dec.is_paused() { "▶" } else { "⏸" }
-                    } else {
-                        "▶"
-                    };
-                    
-                    if ui.add_sized(egui::vec2(40.0, 24.0), egui::Button::new(play_pause_icon)).clicked() {
-                        if let Some(ref dec) = self.decoder {
-                            if dec.is_paused() {
-                                dec.play();
-                            } else {
-                                dec.pause();
-                            }
-                        } else {
-                            self.play_current_playlist_item();
-                        }
-                    }
-
-                    if ui.button("⏭").on_hover_text("Next").clicked() {
-                        if let Some(curr) = self.config.current_index {
-                            if curr + 1 < self.config.playlist.len() {
-                                self.config.current_index = Some(curr + 1);
-                                self.save_config();
-                                self.play_current_playlist_item();
-                            }
-                        }
-                    }
-                    
-                    ui.checkbox(&mut self.config.loop_playlist, "Loop media");
-                });
-            });
-        });
-
-        // Central central workspace for live preview
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(egui::Color32::from_rgb(20, 20, 25)).inner_margin(24.0)).show(ctx, |ui| {
-            // Check if hovered for drop
-            let is_hovered = ctx.input(|i| !i.raw.hovered_files.is_empty());
-            
-            ui.vertical_centered(|ui| {
-                ui.heading("Live Feed Monitor");
-                ui.add_space(8.0);
-                
-                let rect_size = ui.available_size();
-                // Maintain aspect ratio 16:9 for visual preview wrapper
-                let canvas_w = rect_size.x;
-                let canvas_h = rect_size.x * 9.0 / 16.0;
-                
-                let final_size = if canvas_h > rect_size.y {
-                    egui::vec2(rect_size.y * 16.0 / 9.0, rect_size.y)
-                } else {
-                    egui::vec2(canvas_w, canvas_h)
-                };
-
-                let (rect, _) = ui.allocate_exact_size(final_size, egui::Sense::hover());
-                
-                // Draw drop indicator overlay or dynamic preview texture
-                if is_hovered {
-                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(30, 80, 150, 100));
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "📥 DROP MULTIMEDIA FILE TO ADD",
-                        egui::FontId::proportional(18.0),
-                        egui::Color32::WHITE,
-                    );
-                } else if let Some(ref texture) = self.preview_texture {
-                    ui.painter().image(
-                        texture.id(),
-                        rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                } else {
-                    ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "NO MEDIA LOADED\nDrag and drop an image or video file",
-                        egui::FontId::proportional(16.0),
-                        egui::Color32::GRAY,
-                    );
-                }
-            });
-        });
+    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_setup_messages();
+        self.handle_dropped_files(context);
+        self.update_runtime(context);
+        self.show_top_bar(context);
+        self.show_setup_banner(context);
+        self.show_left_panel(context);
+        self.show_playlist(context);
+        self.show_transport(context);
+        self.show_workspace(context);
     }
+}
+
+fn configure_style(context: &egui::Context) {
+    let mut style = (*context.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.slider_width = 160.0;
+    style.visuals.dark_mode = true;
+    style.visuals.panel_fill = PANEL;
+    style.visuals.window_fill = PANEL;
+    style.visuals.extreme_bg_color = egui::Color32::from_rgb(10, 12, 16);
+    style.visuals.faint_bg_color = CARD;
+    style.visuals.widgets.noninteractive.bg_fill = CARD;
+    style.visuals.widgets.noninteractive.fg_stroke.color = TEXT;
+    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(34, 39, 48);
+    style.visuals.widgets.inactive.fg_stroke.color = TEXT;
+    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(45, 55, 69);
+    style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(40, 93, 146);
+    style.visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+    style.visuals.selection.bg_fill = egui::Color32::from_rgb(37, 91, 146);
+    style.visuals.selection.stroke.color = egui::Color32::WHITE;
+    style.visuals.override_text_color = Some(TEXT);
+    context.set_style(style);
+}
+
+fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::none()
+        .fill(CARD)
+        .rounding(8.0)
+        .inner_margin(egui::Margin::same(12.0))
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .show(ui, content);
+}
+
+fn section_heading(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).size(11.0).strong().color(MUTED));
+}
+
+fn status_badge(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+    egui::Frame::none()
+        .fill(color.gamma_multiply(0.14))
+        .rounding(99.0)
+        .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.65)))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).size(10.0).strong().color(color));
+        });
+}
+
+fn draw_empty_preview(ui: &egui::Ui, rect: egui::Rect, title: &str, description: &str) {
+    ui.painter().text(
+        rect.center() - egui::vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        title,
+        egui::FontId::proportional(18.0),
+        TEXT,
+    );
+    ui.painter().text(
+        rect.center() + egui::vec2(0.0, 16.0),
+        egui::Align2::CENTER_CENTER,
+        description,
+        egui::FontId::proportional(13.0),
+        MUTED,
+    );
+}
+
+fn format_time(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn pip_position_label(position: PipPosition) -> &'static str {
+    match position {
+        PipPosition::TopLeft => "Top left",
+        PipPosition::TopRight => "Top right",
+        PipPosition::BottomLeft => "Bottom left",
+        PipPosition::BottomRight => "Bottom right",
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
 }
