@@ -4,12 +4,15 @@ Mimic is a Windows/MSVC application. Use focused checks while editing and run th
 
 ## Prerequisites
 
-- Rust stable, MSVC x64 target.
+- Rust 1.92 as pinned by `rust-toolchain.toml`, with the MSVC x64 target, rustfmt, and
+  clippy. Let rustup honor the repository override.
 - Visual Studio 2022 Build Tools with Desktop development with C++ and a Windows SDK.
 - FFmpeg for runtime tests.
 - Optional: OBS Virtual Camera or UnityCapture for output tests.
 
-If `cargo` reports missing MSVC headers such as `vcruntime.h`, run it after `VsDevCmd.bat` instead of changing the crate:
+The release/package scripts discover Visual Studio with `vswhere` and import a coherent
+x64 developer environment automatically. For ad-hoc Cargo commands, if `cargo` reports
+missing MSVC headers such as `vcruntime.h`, initialize the shell first:
 
 ```powershell
 $devcmd = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat'
@@ -24,6 +27,8 @@ cargo test decoder::tests
 cargo test webcam::tests
 cargo test compositor::tests
 cargo test setup::tests
+cargo test doctor::tests
+cargo test diagnostics::tests
 ```
 
 Cargo accepts one test-name filter at a time. Run separate commands when checking multiple modules.
@@ -31,21 +36,21 @@ Cargo accepts one test-name filter at a time. Run separate commands when checkin
 ## Checkpoint gate
 
 ```powershell
-cargo fmt --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo build
-git diff --check
+./scripts/release-gate.ps1
 ```
 
-The all-platform lockfile currently contains `quick-xml 0.39.4` through Wayland-only scanner tooling even though it is absent from the Windows dependency graph. Until the planned egui/eframe migration removes it, make the target exception explicit instead of hiding it:
+The script runs format, all-target tests, clippy with warnings denied, target-aware audit,
+release builds, packaging, and extracted-package verification. During a focused audit,
+run:
 
 ```powershell
-cargo tree --target x86_64-pc-windows-msvc -i quick-xml
-cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+./scripts/verify-audit.ps1
 ```
 
-The first command must remain empty. The second still prints maintenance and unsoundness warnings that should be reviewed during dependency migration.
+The all-platform lockfile contains vulnerable `quick-xml 0.39.4` only through
+Wayland build tooling. The audit script first proves `quick-xml`, `anyhow`, and `memmap2`
+are absent from the Windows target graph, then applies the two documented Wayland-only
+advisory exceptions. A future dependency edge into the Windows product fails the gate.
 
 Run Cargo commands through the x64 Visual Studio developer environment when the current shell does not already have `INCLUDE`, `LIB`, and the Windows SDK variables.
 
@@ -68,14 +73,23 @@ A deterministic two-second fixture can be generated outside tracked source:
 ffmpeg -f lavfi -i testsrc2=size=640x360:rate=30 -t 2 -pix_fmt yuv420p mimic-sample.mp4
 ```
 
-## Release evidence still required
+## Release evidence obtained
+
+The dated [release-readiness report](release-readiness-2026-07-15.md) records:
+
+- focused and full automated checks;
+- real media decode and bounded soak metrics;
+- explicit physical-camera frame proof without retained images;
+- OBS virtual-camera frames captured by an independent FFmpeg receiver;
+- native layout, keyboard focus, accessibility-name, and file-picker inspection;
+- repeatable package generation and extracted-package smoke.
+
+## External release evidence still required
 
 Before calling a packaged release ready, retain evidence for:
 
-- clean-machine build and launch;
-- installer/uninstaller behavior and signatures;
+- clean-machine launch and trust behavior;
+- installer/repair/upgrade/uninstaller behavior and signatures;
 - UnityCapture setup under UAC approval and denial;
-- OBS and Unity receiver-side video at every exposed output format;
-- physical-camera PiP on representative devices;
-- long-running playback, playlist rollover, and resource usage;
-- accessibility and keyboard traversal at the minimum window size.
+- OBS and Unity receiver-side video at every exposed output format on the release image;
+- longer multi-hour endurance and broader hardware coverage.

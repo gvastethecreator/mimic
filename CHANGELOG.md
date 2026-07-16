@@ -14,6 +14,14 @@ All notable changes to Mimic are recorded here. The project has not published a 
 - Pinned size- and SHA-256-verified FFmpeg and UnityCapture downloads.
 - Unit coverage for configuration, metadata parsing, webcam parsing, composition boundaries, backend labels, and integrity helpers.
 - Runtime architecture, development verification, and upstream research documentation.
+- `mimic-doctor` environment, media, physical-camera, virtual-receiver, and bounded-soak
+  probes with human/JSON output and stable exit codes.
+- Bounded rotating local diagnostics with no frame retention or remote telemetry.
+- Windows CI, target-aware dependency audit policy, deterministic portable packaging,
+  provenance/checksum verification, and optional fail-closed Authenticode signing.
+- Automatic MSVC x64/Windows SDK environment discovery for release/package scripts.
+- A build-derived multi-resolution Windows application icon and version metadata.
+- ADR, task, research, runbook, and release-evidence ledgers.
 
 ### Changed
 
@@ -23,6 +31,9 @@ All notable changes to Mimic are recorded here. The project has not published a 
 - Moved playlist/configuration rules out of the UI into a tested domain module.
 - Locked output format while the virtual camera is active.
 - Disabled unused eframe Wayland/X11/web defaults in this Windows-only application while retaining accessibility, fonts, and the Glow renderer.
+- Pinned Rust 1.92 and migrated eframe to 0.35, rfd to 0.17, ureq to 3.3, sha2
+  to 0.11, and windows-sys to 0.61.
+- Split reusable runtime modules into a library consumed by the GUI and diagnostics.
 
 ### Fixed
 
@@ -32,3 +43,9 @@ All notable changes to Mimic are recorded here. The project has not published a 
 - Normalized malformed RGB frame lengths and clamped PiP composition to output bounds.
 - Replaced invalid mutable setup URLs with pinned upstream artifacts.
 - Prevented repeated preview-texture allocation and continuous busy repainting.
+- Parsed modern headerless FFmpeg DirectShow device listings instead of silently
+  reporting no cameras.
+- Warmed virtual output before independent receiver capture, eliminating startup-frame
+  loss from the verification path.
+- Added explicit accessible names to resolution, frame-rate, physical-source,
+  placement, and playback-position controls.

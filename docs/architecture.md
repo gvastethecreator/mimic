@@ -29,7 +29,11 @@ FFmpeg processes decode or capture raw RGB24 frames. Mimic composites the option
 | `webcam` | DirectShow device discovery and FFmpeg capture lifecycle | Capture errors surface to the UI; only a bounded number of frames can queue. |
 | `compositor` | Frame normalization, rounded PiP composition, virtual-camera lifecycle | Malformed frame lengths are normalized; send errors are returned to the UI. |
 | `gui` | Product state, user feedback, repaint cadence, preview, transport, setup controls | Output format is locked while live and output cannot start without media and a backend. |
-| `main` | Native window configuration and app startup | Establishes the minimum supported layout size. |
+| `diagnostics` | Bounded JSONL product-event logging and rotation | Stores sanitized event metadata, never decoded/captured frames. |
+| `doctor` | Scriptable environment, media, camera, receiver, and soak proofs | Every probe has bounded work, cleanup, typed reports, and stable result semantics. |
+| `lib` | Shared application surface for GUI and diagnostic binaries | Keeps the CLI testable without coupling it to console-host behavior. |
+| `main` | Native window configuration and GUI startup | Establishes application identity and the minimum supported layout size. |
+| `build.rs` | Windows icon and version-resource generation | Derives all ICO sizes from the tracked SVG source during the build. |
 
 ## State and lifecycle
 
@@ -49,6 +53,10 @@ Decoder and webcam workers use bounded frame channels. If the UI is temporarily 
 
 Settings store file paths and device names only. Video frames are not written by Mimic.
 
+Product events are appended to `%APPDATA%\mimic\logs\mimic.jsonl`. The active log is
+limited to 512 KiB and rotated through three backups. Event titles and sanitized detail
+are retained for local support; there is no network telemetry.
+
 ## Setup integrity
 
 Mimic first looks for a working `ffmpeg` in `PATH`, then its managed AppData copy, then an executable beside Mimic. Discovery executes `ffmpeg -version`; path existence alone is not readiness.
@@ -56,6 +64,18 @@ Mimic first looks for a working `ffmpeg` in `PATH`, then its managed AppData cop
 Managed downloads use a `.download` partial file. Mimic checks the upstream reported length when present, streamed byte count, expected size, and SHA-256, flushes the file, then atomically activates it. Failed or mismatched downloads are removed. The exact upstream decision and hashes are recorded in [the research note](research/2026-07-15-runtime-stack-recovery.md).
 
 Unity registration uses an elevated `regsvr32` request. Starting elevation is not considered success: Mimic polls the supported Unity backend registration and reports a failure if the device does not become available.
+
+## Verification architecture
+
+`mimic-doctor` deliberately tests both sides of a virtual-camera boundary. It sends a
+deterministic RGB pattern, warms the backend, then starts an independent FFmpeg
+DirectShow receiver and requires the requested frame count plus aggregate hashes. Sender
+acceptance alone is not a pass. Media, camera, and soak probes follow the same bounded
+frame/event channels as the GUI and terminate owned child processes on every exit path.
+
+The diagnostic JSON schema is versioned (`schema_version: 1`). Human output and JSON
+share typed reports, while process exit codes distinguish invalid input, unavailable
+prerequisites, and failed/timed-out proofs.
 
 ## Failure and recovery matrix
 
@@ -76,4 +96,5 @@ Unity registration uses an elevated `regsvr32` request. Starting elevation is no
 - No cross-platform backend abstraction beyond the Windows `virtualcam` implementation.
 - No persistence of decoded or captured frames.
 - No promise that every FFmpeg-supported codec is accepted by a receiving application.
-- No release installer or driver-uninstall workflow yet.
+- The repository produces an unsigned portable ZIP; certificate-backed signing and a
+  clean-machine installer/driver-uninstall lifecycle remain external gates.
