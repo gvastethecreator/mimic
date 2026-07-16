@@ -2,14 +2,33 @@
 name = "mimic"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.92"
+description = "A local Windows studio for turning media and a physical camera into a virtual camera feed."
+license = "MIT"
+repository = "https://github.com/gvastethecreator/mimic"
+readme = "README.md"
+keywords = ["virtual-camera", "webcam", "video", "windows"]
+categories = ["multimedia::video", "gui"]
+default-run = "mimic"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [dependencies]
-eframe = { version = "0.27", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+clap = { version = "4.6", features = ["derive"] }
+eframe = { version = "0.35", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 virtualcam = "0.1.1"
-ureq = { version = "2.9", features = ["tls"] }
+ureq = "3.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rfd = "0.14"
-sha2 = "0.10"
-windows-sys = { version = "0.52", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Registry", "Win32_Storage_FileSystem"] }
+rfd = { version = "0.17", default-features = false, features = ["common-controls-v6"] }
+sha2 = "0.11"
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 dirs-next = "2.0"
+
+[target.'cfg(windows)'.build-dependencies]
+ico = "0.5"
+resvg = { version = "0.47", default-features = false }
+winres = "0.1"

@@ -1,13 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Hide console window in release build
 
-mod compositor;
-mod config;
-mod decoder;
-mod gui;
-mod setup;
-mod webcam;
-
 use eframe::egui;
+use mimic::gui::MimicApp;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
@@ -22,6 +16,6 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "mimic_app",
         options,
-        Box::new(|cc| Box::new(gui::MimicApp::new(cc))),
+        Box::new(|cc| Ok(Box::new(MimicApp::new(cc)))),
     )
 }

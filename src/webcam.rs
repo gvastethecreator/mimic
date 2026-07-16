@@ -162,18 +162,9 @@ pub fn list_webcams(ffmpeg_path: &Path) -> Result<Vec<String>, String> {
 
 fn parse_directshow_devices(output: &str) -> Vec<String> {
     let mut devices = Vec::new();
-    let mut parsing_video = false;
 
     for line in output.lines() {
-        if line.contains("DirectShow video devices") {
-            parsing_video = true;
-            continue;
-        }
-        if line.contains("DirectShow audio devices") {
-            parsing_video = false;
-            continue;
-        }
-        if !parsing_video || line.contains("Alternative name") {
+        if line.contains("Alternative name") {
             continue;
         }
 
@@ -183,6 +174,10 @@ fn parse_directshow_devices(output: &str) -> Vec<String> {
         let Some(end) = line[start + 1..].find('"') else {
             continue;
         };
+        let suffix = &line[start + 1 + end + 1..];
+        if !suffix.contains("(video)") {
+            continue;
+        }
         let name = &line[start + 1..start + 1 + end];
         if !name.is_empty() && !devices.iter().any(|device| device == name) {
             devices.push(name.to_string());
@@ -224,6 +219,18 @@ mod tests {
     #[test]
     fn parser_handles_empty_output() {
         assert!(parse_directshow_devices("").is_empty());
+    }
+
+    #[test]
+    fn parser_supports_headerless_ffmpeg_device_output() {
+        let output = r#"
+[in#0 @ 0001] "Logitech BRIO" (video)
+[in#0 @ 0001]   Alternative name "@device_pnp_long_name"
+[in#0 @ 0001] "OBS Virtual Camera" (none)
+[in#0 @ 0001] "Microphone" (audio)
+"#;
+
+        assert_eq!(parse_directshow_devices(output), vec!["Logitech BRIO"]);
     }
 
     #[test]

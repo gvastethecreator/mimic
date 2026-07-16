@@ -45,22 +45,30 @@ impl VirtualCameraBackend {
     }
 }
 
-pub fn get_app_dir() -> PathBuf {
+pub fn app_dir_path() -> PathBuf {
     let mut path = dirs_next::data_dir().unwrap_or_else(|| {
         PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:".to_string()))
     });
     path.push("mimic");
+    path
+}
+
+pub fn get_app_dir() -> PathBuf {
+    let path = app_dir_path();
     let _ = std::fs::create_dir_all(&path);
     path
 }
 
-pub fn get_ffmpeg_path() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from("ffmpeg"), get_app_dir().join("ffmpeg.exe")];
+pub fn ffmpeg_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("ffmpeg"), app_dir_path().join("ffmpeg.exe")];
     if let Some(local) = local_executable_sibling("ffmpeg.exe") {
         candidates.push(local);
     }
-
     candidates
+}
+
+pub fn get_ffmpeg_path() -> Option<PathBuf> {
+    ffmpeg_candidates()
         .into_iter()
         .find(|candidate| validate_ffmpeg(candidate))
 }
@@ -190,12 +198,18 @@ where
     let _ = std::fs::remove_file(&partial);
 
     let result = (|| -> Result<(), String> {
-        let response = ureq::get(url)
-            .timeout(Duration::from_secs(90))
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(90)))
+            .build()
+            .into();
+        let response = agent
+            .get(url)
             .call()
             .map_err(|error| format!("Download request failed: {error}"))?;
         let reported_bytes = response
-            .header("Content-Length")
+            .headers()
+            .get("Content-Length")
+            .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
         if reported_bytes.is_some_and(|bytes| bytes != expected_bytes) {
             return Err(format!(
@@ -204,7 +218,7 @@ where
             ));
         }
 
-        let mut reader = response.into_reader();
+        let mut reader = response.into_body().into_reader();
         let mut file = File::create(&partial)
             .map_err(|error| format!("Could not create partial download: {error}"))?;
         let mut hash = Sha256::new();
@@ -232,7 +246,8 @@ where
                 "Downloaded file is incomplete (expected {expected_bytes} bytes, received {downloaded})"
             ));
         }
-        let actual_sha256 = format!("{:x}", hash.finalize());
+        let digest = hash.finalize();
+        let actual_sha256 = hex_lower(&digest);
         if actual_sha256 != expected_sha256 {
             return Err(format!(
                 "Downloaded file failed integrity verification (expected SHA-256 {expected_sha256}, got {actual_sha256})"
@@ -269,7 +284,18 @@ fn sha256_file(path: &Path) -> io::Result<String> {
         }
         hash.update(&buffer[..bytes_read]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    let digest = hash.finalize();
+    Ok(hex_lower(&digest))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    value
 }
 
 fn local_executable_sibling(file_name: &str) -> Option<PathBuf> {

@@ -9,6 +9,7 @@ use rfd::FileDialog;
 use crate::compositor::{FrameCompositor, PipPosition};
 use crate::config::{self, AppConfig, MEDIA_EXTENSIONS};
 use crate::decoder::MediaDecoder;
+use crate::diagnostics;
 use crate::setup::{self, VirtualCameraBackend};
 use crate::webcam::{self, WebcamCapture};
 
@@ -75,6 +76,7 @@ pub struct MimicApp {
 impl MimicApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_style(&cc.egui_ctx);
+        let _ = diagnostics::record_event("info", "Application started");
         let config_path = setup::get_app_dir().join("config.json");
         let loaded = config::load(&config_path);
         let ffmpeg_path = setup::get_ffmpeg_path();
@@ -132,9 +134,17 @@ impl MimicApp {
         title: impl Into<String>,
         message: impl Into<String>,
     ) {
+        let title = title.into();
+        let level_name = match level {
+            NoticeLevel::Info => "info",
+            NoticeLevel::Success => "success",
+            NoticeLevel::Warning => "warning",
+            NoticeLevel::Error => "error",
+        };
+        let _ = diagnostics::record_event(level_name, &title);
         self.notice = Some(Notice {
             level,
-            title: title.into(),
+            title,
             message: message.into(),
         });
     }
@@ -628,16 +638,16 @@ impl MimicApp {
         }
     }
 
-    fn show_top_bar(&mut self, context: &egui::Context) {
-        egui::TopBottomPanel::top("top_bar")
-            .exact_height(54.0)
+    fn show_top_bar(&mut self, root: &mut egui::Ui) {
+        egui::Panel::top("top_bar")
+            .exact_size(54.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(egui::Color32::from_rgb(17, 19, 24))
-                    .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+                    .inner_margin(egui::Margin::symmetric(18, 10))
                     .stroke(egui::Stroke::new(1.0, BORDER)),
             )
-            .show(context, |ui| {
+            .show(root, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("MIMIC").size(20.0).strong().color(TEXT));
                     ui.label(egui::RichText::new("Virtual camera studio").color(MUTED));
@@ -665,18 +675,19 @@ impl MimicApp {
             });
     }
 
-    fn show_setup_banner(&mut self, context: &egui::Context) {
+    fn show_setup_banner(&mut self, root: &mut egui::Ui) {
         if self.ffmpeg_path.is_some() && !self.virtual_camera_backends.is_empty() {
             return;
         }
-        egui::TopBottomPanel::top("setup_banner")
+        let context = root.ctx().clone();
+        egui::Panel::top("setup_banner")
             .frame(
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(egui::Color32::from_rgb(40, 31, 20))
-                    .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+                    .inner_margin(egui::Margin::symmetric(18, 10))
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(93, 68, 31))),
             )
-            .show(context, |ui| {
+            .show(root, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Finish setup").strong().color(WARNING));
                     if self.ffmpeg_path.is_none() {
@@ -688,7 +699,7 @@ impl MimicApp {
                                     .text(format!("FFmpeg {:.0}%", self.ffmpeg_progress * 100.0)),
                             );
                         } else if ui.button("Install verified FFmpeg").clicked() {
-                            self.begin_ffmpeg_download(context);
+                            self.begin_ffmpeg_download(&context);
                         }
                     }
                     if self.virtual_camera_backends.is_empty() {
@@ -709,7 +720,7 @@ impl MimicApp {
                                     }),
                             );
                         } else if ui.button("Install Unity Capture").clicked() {
-                            self.begin_driver_install(context);
+                            self.begin_driver_install(&context);
                         }
                     }
                     if !self.downloading_ffmpeg
@@ -722,17 +733,17 @@ impl MimicApp {
             });
     }
 
-    fn show_left_panel(&mut self, context: &egui::Context) {
-        egui::SidePanel::left("controls")
-            .exact_width(278.0)
+    fn show_left_panel(&mut self, root: &mut egui::Ui) {
+        egui::Panel::left("controls")
+            .exact_size(278.0)
             .resizable(false)
             .frame(
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(PANEL)
-                    .inner_margin(egui::Margin::same(16.0))
+                    .inner_margin(egui::Margin::same(16))
                     .stroke(egui::Stroke::new(1.0, BORDER)),
             )
-            .show(context, |ui| {
+            .show(root, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     section_heading(ui, "OUTPUT");
                     card(ui, |ui| self.show_output_controls(ui));
@@ -778,7 +789,8 @@ impl MimicApp {
         let old_resolution = self.config.output_resolution_index;
         let old_fps = self.config.output_fps_index;
         ui.add_enabled_ui(!streaming, |ui| {
-            egui::ComboBox::from_id_source("resolution")
+            let resolution_label = ui.label(egui::RichText::new("Resolution").small().color(MUTED));
+            let resolution_combo = egui::ComboBox::from_id_salt("resolution")
                 .selected_text(match self.config.output_resolution_index {
                     1 => "1920 × 1080",
                     2 => "640 × 480",
@@ -790,7 +802,9 @@ impl MimicApp {
                     ui.selectable_value(&mut self.config.output_resolution_index, 1, "1920 × 1080");
                     ui.selectable_value(&mut self.config.output_resolution_index, 2, "640 × 480");
                 });
-            egui::ComboBox::from_id_source("frame_rate")
+            resolution_combo.response.labelled_by(resolution_label.id);
+            let frame_rate_label = ui.label(egui::RichText::new("Frame rate").small().color(MUTED));
+            let frame_rate_combo = egui::ComboBox::from_id_salt("frame_rate")
                 .selected_text(if self.config.output_fps_index == 1 {
                     "60 frames per second"
                 } else {
@@ -809,6 +823,7 @@ impl MimicApp {
                         "60 frames per second",
                     );
                 });
+            frame_rate_combo.response.labelled_by(frame_rate_label.id);
         });
         if old_resolution != self.config.output_resolution_index
             || old_fps != self.config.output_fps_index
@@ -854,21 +869,24 @@ impl MimicApp {
         }
 
         ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Source").strong().color(TEXT));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Refresh").clicked() {
-                    self.refresh_webcam_list(true);
-                }
-            });
-        });
+        let source_label = ui
+            .horizontal(|ui| {
+                let label = ui.label(egui::RichText::new("Source").strong().color(TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Refresh").clicked() {
+                        self.refresh_webcam_list(true);
+                    }
+                });
+                label.id
+            })
+            .inner;
         let selected_text = self
             .config
             .selected_webcam
             .as_deref()
             .unwrap_or("Choose a camera");
         let mut selected_camera = None;
-        egui::ComboBox::from_id_source("physical_camera")
+        let camera_combo = egui::ComboBox::from_id_salt("physical_camera")
             .selected_text(selected_text)
             .width(ui.available_width())
             .show_ui(ui, |ui| {
@@ -887,6 +905,7 @@ impl MimicApp {
                     }
                 }
             });
+        camera_combo.response.labelled_by(source_label);
         if let Some(camera) = selected_camera {
             self.config.selected_webcam = Some(camera);
             self.persist_config();
@@ -894,9 +913,9 @@ impl MimicApp {
         }
 
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("Placement").strong().color(TEXT));
+        let placement_label = ui.label(egui::RichText::new("Placement").strong().color(TEXT));
         let previous_position = self.config.pip_position;
-        egui::ComboBox::from_id_source("pip_position")
+        let placement_combo = egui::ComboBox::from_id_salt("pip_position")
             .selected_text(pip_position_label(self.config.pip_position))
             .width(ui.available_width())
             .show_ui(ui, |ui| {
@@ -921,6 +940,7 @@ impl MimicApp {
                     "Bottom right",
                 );
             });
+        placement_combo.response.labelled_by(placement_label.id);
         if previous_position != self.config.pip_position {
             self.persist_config();
             self.preview_dirty = true;
@@ -949,17 +969,17 @@ impl MimicApp {
         }
     }
 
-    fn show_playlist(&mut self, context: &egui::Context) {
-        egui::SidePanel::right("playlist")
-            .exact_width(252.0)
+    fn show_playlist(&mut self, root: &mut egui::Ui) {
+        egui::Panel::right("playlist")
+            .exact_size(252.0)
             .resizable(false)
             .frame(
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(PANEL)
-                    .inner_margin(egui::Margin::same(14.0))
+                    .inner_margin(egui::Margin::same(14))
                     .stroke(egui::Stroke::new(1.0, BORDER)),
             )
-            .show(context, |ui| {
+            .show(root, |ui| {
                 section_heading(ui, "PLAYLIST");
                 ui.add_space(6.0);
                 if ui
@@ -1005,10 +1025,10 @@ impl MimicApp {
                         } else {
                             CARD
                         };
-                        egui::Frame::none()
+                        egui::Frame::new()
                             .fill(fill)
-                            .rounding(7.0)
-                            .inner_margin(egui::Margin::same(9.0))
+                            .corner_radius(7)
+                            .inner_margin(egui::Margin::same(9))
                             .stroke(egui::Stroke::new(1.0, if active { ACCENT } else { BORDER }))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -1021,7 +1041,7 @@ impl MimicApp {
                                     let label = ui
                                         .add_sized(
                                             [name_width, 24.0],
-                                            egui::SelectableLabel::new(
+                                            egui::Button::selectable(
                                                 active,
                                                 egui::RichText::new(name).color(color),
                                             ),
@@ -1065,16 +1085,16 @@ impl MimicApp {
             });
     }
 
-    fn show_transport(&mut self, context: &egui::Context) {
-        egui::TopBottomPanel::bottom("transport")
-            .exact_height(86.0)
+    fn show_transport(&mut self, root: &mut egui::Ui) {
+        egui::Panel::bottom("transport")
+            .exact_size(86.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+                    .inner_margin(egui::Margin::symmetric(18, 10))
                     .stroke(egui::Stroke::new(1.0, BORDER)),
             )
-            .show(context, |ui| {
+            .show(root, |ui| {
                 let current_time = self
                     .decoder
                     .as_ref()
@@ -1097,6 +1117,13 @@ impl MimicApp {
                             .show_value(false);
                     let response =
                         ui.add_enabled(self.decoder.is_some() && !duration.is_zero(), slider);
+                    response.widget_info(|| {
+                        egui::WidgetInfo::slider(
+                            self.decoder.is_some() && !duration.is_zero(),
+                            f64::from(seek),
+                            "Playback position",
+                        )
+                    });
                     if response.dragged() {
                         self.seek_drag_value = Some(seek);
                     }
@@ -1176,10 +1203,15 @@ impl MimicApp {
             });
     }
 
-    fn show_workspace(&mut self, context: &egui::Context) {
+    fn show_workspace(&mut self, root: &mut egui::Ui) {
+        let context = root.ctx().clone();
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BACKGROUND).inner_margin(18.0))
-            .show(context, |ui| {
+            .frame(
+                egui::Frame::new()
+                    .fill(BACKGROUND)
+                    .inner_margin(egui::Margin::same(18)),
+            )
+            .show(root, |ui| {
                 self.show_notice(ui);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Preview").size(18.0).strong().color(TEXT));
@@ -1296,10 +1328,10 @@ impl MimicApp {
             NoticeLevel::Error => DANGER,
         };
         let mut dismiss = false;
-        egui::Frame::none()
+        egui::Frame::new()
             .fill(color.gamma_multiply(0.12))
-            .rounding(8.0)
-            .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(12, 9))
             .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.7)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1322,21 +1354,25 @@ impl MimicApp {
 }
 
 impl eframe::App for MimicApp {
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_setup_messages();
         self.handle_dropped_files(context);
         self.update_runtime(context);
-        self.show_top_bar(context);
-        self.show_setup_banner(context);
-        self.show_left_panel(context);
-        self.show_playlist(context);
-        self.show_transport(context);
-        self.show_workspace(context);
+    }
+
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show_top_bar(root);
+        self.show_setup_banner(root);
+        self.show_left_panel(root);
+        self.show_playlist(root);
+        self.show_transport(root);
+        self.show_workspace(root);
     }
 }
 
 fn configure_style(context: &egui::Context) {
-    let mut style = (*context.style()).clone();
+    context.set_theme(egui::Theme::Dark);
+    let mut style = (*context.style_of(egui::Theme::Dark)).clone();
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
     style.spacing.slider_width = 160.0;
@@ -1356,14 +1392,14 @@ fn configure_style(context: &egui::Context) {
     style.visuals.selection.bg_fill = egui::Color32::from_rgb(37, 91, 146);
     style.visuals.selection.stroke.color = egui::Color32::WHITE;
     style.visuals.override_text_color = Some(TEXT);
-    context.set_style(style);
+    context.set_style_of(egui::Theme::Dark, style);
 }
 
 fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(CARD)
-        .rounding(8.0)
-        .inner_margin(egui::Margin::same(12.0))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(12))
         .stroke(egui::Stroke::new(1.0, BORDER))
         .show(ui, content);
 }
@@ -1373,10 +1409,10 @@ fn section_heading(ui: &mut egui::Ui, text: &str) {
 }
 
 fn status_badge(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(color.gamma_multiply(0.14))
-        .rounding(99.0)
-        .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+        .corner_radius(99)
+        .inner_margin(egui::Margin::symmetric(9, 4))
         .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.65)))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(label).size(10.0).strong().color(color));
