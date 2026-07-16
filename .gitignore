@@ -1,5 +1,6 @@
 /target
 /.scratch/
+/dist/
 
 # IDEs and editors
 .vscode/

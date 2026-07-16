@@ -1,0 +1,46 @@
+name: Windows quality gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mimic-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
+          rustup override set 1.92.0
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Run release gate
+        run: ./scripts/release-gate.ps1
+
+      - name: Upload unsigned release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: mimic-windows-x64-unsigned
+          path: |
+            dist/mimic-v*-windows-x64.zip
+            dist/mimic-v*-windows-x64.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
